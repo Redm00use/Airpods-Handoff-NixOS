@@ -1,0 +1,4 @@
+Repository: https://github.com/hacel/airpodsctl
+Base revision: 5c3064634c3f993c78d064b6485d3610ac6224bb
+License: MIT (see LICENSE)
+Locally modified for external ownership policy, authenticated routing events, guarded media takeover and bounded error handling.

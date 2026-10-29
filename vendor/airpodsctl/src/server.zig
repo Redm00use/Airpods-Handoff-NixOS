@@ -1,0 +1,903 @@
+const std = @import("std");
+const aacp = @import("aacp");
+const bluez = @import("bluez");
+const bluez_media = @import("bluez_media");
+const cli = @import("cli");
+const controller = @import("controller");
+const ipc = @import("ipc");
+const media = @import("media");
+const routing = @import("smart_routing");
+const support = @import("support");
+const switching_policy = @import("switching_policy");
+const transport = @import("transport");
+const wear_policy = @import("wear_policy");
+
+const c = support.c;
+const operation_timeout_ms = 3000;
+const ipc_reply_timeout_ms = 1000;
+const initialization_delay_ms = 150;
+const idle_poll_ms = 1000;
+const max_reconnect_delay_ms = 30_000;
+const transport_settlement_ms = 500;
+
+pub const Error = error{ServerFailure};
+
+var stop_requested: c.sig_atomic_t = 0;
+
+fn handleSignal(_: c_int) callconv(.c) void {
+    const flag: *volatile c.sig_atomic_t = &stop_requested;
+    flag.* = 1;
+}
+
+const Connection = struct {
+    fd: c_int,
+    address: bluez.Address,
+    control: controller.Controller,
+};
+
+const Server = struct {
+    release_requested: bool = false,
+    event_sequence: u64 = 0,
+    event_generation: u64 = 0,
+    requested_address: ?[]const u8,
+    wear: wear_policy.Policy,
+    switching: switching_policy.Policy,
+    connection: ?Connection = null,
+    players: media.Controller = .{},
+    media_available: ?bool = null,
+    logged_playing: ?bool = null,
+    media_retry_at_ms: i64 = 0,
+    reconnect_at_ms: i64 = 0,
+    reconnect_delay_ms: i64 = idle_poll_ms,
+    transport_recovery_pending: bool = false,
+    transport_recovery_explicit: bool = false,
+    failure: support.ErrorMessage = .{},
+
+    // A nonblocking, versioned event feed; the existing controller remains the sole AACP reader.
+    fn publishRouting(self: *Server, connected: bool) void {
+        const runtime = c.getenv("XDG_RUNTIME_DIR") orelse return;
+        var path_buffer: [108]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buffer, "{s}/airpods-handoff.events", .{std.mem.span(runtime)}) catch return;
+        var address: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
+        address.sun_family = c.AF_UNIX;
+        if (path.len >= address.sun_path.len) return;
+        @memcpy(address.sun_path[0..path.len], path);
+        const fd = c.socket(c.AF_UNIX, c.SOCK_DGRAM | c.SOCK_CLOEXEC | c.SOCK_NONBLOCK, 0);
+        if (fd < 0) return;
+        defer _ = c.close(fd);
+        const status = if (self.connection) |connection| connection.control.state.routing.status() else routing.Status{
+            .hosts = .unknown, .owner = .unknown, .remote_activity = .unknown,
+        };
+        const source = if (self.connection) |connection| connection.control.state.routing.source.name() else "unknown";
+        const kind = if (self.connection) |connection| connection.control.state.routing.source_kind.kindName() else "unknown";
+        self.event_sequence += 1;
+        var buffer: [512]u8 = undefined;
+        const data = std.fmt.bufPrint(&buffer,
+            "{{\"version\":2,\"sequence\":{d},\"generation\":{d},\"connected\":{s},\"ready\":{s},\"hosts\":\"{s}\",\"owner\":\"{s}\",\"remote_activity\":\"{s}\",\"source\":\"{s}\",\"source_kind\":\"{s}\",\"release_request\":{s}}}",
+            .{self.event_sequence, self.event_generation, if (connected) "true" else "false", if (connected and status.isReady()) "true" else "false", status.hosts.name(), status.owner.name(), status.remote_activity.name(), source, kind, if (self.release_requested) "true" else "false"}) catch return;
+        _ = c.sendto(fd, data.ptr, data.len, c.MSG_NOSIGNAL | c.MSG_DONTWAIT,
+            .{ .__sockaddr__ = @ptrCast(&address) }, @sizeOf(c.struct_sockaddr_un));
+    }
+
+    fn needsPersistentConnection(self: *const Server) bool {
+        // External policy reconnects AACP on BlueZ events, not an endless discovery timer.
+        return self.switching.mode != .external;
+    }
+
+    fn disconnect(self: *Server) void {
+        if (self.connection) |connection| {
+            bluez.close(connection.fd);
+            support.log(.debug, "Closed the AirPods control connection because its cached protocol state is no longer valid.", .{});
+        }
+        self.connection = null;
+        self.publishRouting(false);
+        self.transport_recovery_pending = false;
+        self.transport_recovery_explicit = false;
+        self.wear.reset();
+        self.switching.remoteTakeover();
+        self.players.clear();
+        if (self.needsPersistentConnection()) {
+            self.reconnect_at_ms = transport.nowMs() + self.reconnect_delay_ms;
+            if ((@as(*volatile c.sig_atomic_t, &stop_requested)).* == 0) support.log(
+                .info,
+                "Retrying the AirPods connection in {d} ms because enabled host policies require continuous AACP wear or routing notifications.",
+                .{self.reconnect_delay_ms},
+            );
+            self.reconnect_delay_ms = @min(self.reconnect_delay_ms * 2, max_reconnect_delay_ms);
+        }
+    }
+
+    fn warnMedia(_: *Server, message: []const u8) void {
+        support.warn(message);
+    }
+
+    fn switchingEligibility(self: *const Server) switching_policy.Eligibility {
+        const status = if (self.connection) |connection|
+            connection.control.state.routing.status()
+        else
+            return .{ .multipoint_ready = false, .remote_idle = false };
+
+        return .{
+            .multipoint_ready = status.isReady(),
+            .remote_idle = status.remote_activity == .idle,
+        };
+    }
+
+    fn mediaTransportState(self: *Server, reason: []const u8) ?bluez.MediaTransportState {
+        const connection = self.connection orelse return null;
+        const state = bluez.mediaTransportState(connection.address, &self.failure) catch {
+            support.log(
+                .warn,
+                "BlueZ A2DP transport state is unavailable after {s}: {s}.",
+                .{ reason, self.failure.text() },
+            );
+            self.failure.len = 0;
+            return null;
+        };
+        support.log(
+            .debug,
+            "BlueZ reports the AirPods A2DP transport as '{s}' after {s}.",
+            .{ state.name(), reason },
+        );
+        return state;
+    }
+
+    fn reportTakeTransport(self: *Server, reason: []const u8) void {
+        const state = self.mediaTransportState(reason) orelse return;
+
+        if (self.logged_playing == true and !state.isUsable()) {
+            support.log(
+                .warn,
+                "Linux owns AirPods routing arbitration, but BlueZ reports the A2DP transport as '{s}' while MPRIS is Playing; audio is not yet confirmed usable.",
+                .{state.name()},
+            );
+        }
+    }
+
+    fn scheduleTransportRecovery(self: *Server, explicit: bool) void {
+        self.transport_recovery_pending = true;
+        self.transport_recovery_explicit = explicit;
+    }
+
+    fn ensureTransport(self: *Server) void {
+        if (!self.transport_recovery_pending) return;
+        self.transport_recovery_pending = false;
+
+        const connection = if (self.connection) |*value| value else return;
+        const playback_active = self.logged_playing == true;
+        const explicit_take = self.transport_recovery_explicit;
+        self.transport_recovery_explicit = false;
+        var state = bluez.mediaTransportState(connection.address, &self.failure) catch {
+            self.warnMedia("A2DP recovery was skipped because BlueZ transport state could not be read safely.");
+            self.failure.len = 0;
+            return;
+        };
+        var decision = bluez_media.recoveryDecision(state, playback_active, false, explicit_take);
+        if (decision == .wait) {
+            state = bluez.waitForMediaTransport(
+                connection.address,
+                transport.nowMs() + transport_settlement_ms,
+                &self.failure,
+            ) catch {
+                self.warnMedia("A2DP recovery was skipped because BlueZ transport settlement could not be observed safely.");
+                self.failure.len = 0;
+                return;
+            };
+            decision = bluez_media.recoveryDecision(state, playback_active, true, explicit_take);
+        }
+
+        switch (decision) {
+            .none => {
+                if (playback_active) support.log(
+                    .info,
+                    "Linux audio is usable because BlueZ confirmed that the AirPods A2DP transport is active after routing ownership changed.",
+                    .{},
+                );
+            },
+            .wait => unreachable,
+            .connect_profile => {
+                support.log(
+                    .info,
+                    "Connecting only the AirPods A2DP Sink profile because routing ownership is local but BlueZ has no media transport for the selected device.",
+                    .{},
+                );
+                bluez.connectAudioProfile(connection.address, &self.failure) catch {
+                    self.warnMedia("A2DP profile connection failed because BlueZ could not connect the selected AirPods audio profile.");
+                    self.failure.len = 0;
+                    return;
+                };
+                state = bluez.waitForMediaTransportPresent(
+                    connection.address,
+                    transport.nowMs() + operation_timeout_ms,
+                    &self.failure,
+                ) catch {
+                    self.warnMedia("A2DP profile connection completed, but BlueZ transport creation could not be observed safely.");
+                    self.failure.len = 0;
+                    return;
+                };
+                support.log(
+                    if (state == .absent) .warn else .info,
+                    "BlueZ reports the AirPods A2DP transport as '{s}' after connecting the missing audio profile.",
+                    .{state.name()},
+                );
+            },
+            .fail_closed => support.log(
+                .warn,
+                "A2DP recovery was suppressed because BlueZ reported an unknown transport state while MPRIS was Playing.",
+                .{},
+            ),
+            .reset_profile => {
+                support.log(
+                    .warn,
+                    "Resetting only the AirPods A2DP profile because routing ownership is local, MPRIS is Playing, and BlueZ did not activate the transport during the settlement window.",
+                    .{},
+                );
+                if (self.players.hasOwnership()) {
+                    self.warnMedia("A2DP recovery was suppressed because MPRIS pause ownership is already reserved for wear-aware automatic resume.");
+                    return;
+                }
+                self.players.pausePlayers() catch {
+                    self.warnMedia("A2DP recovery was suppressed because eligible MPRIS players could not be paused safely.");
+                    return;
+                };
+                if (!self.players.hasOwnership()) {
+                    self.warnMedia("A2DP recovery was suppressed because airpodsctl could not confirm ownership of any MPRIS pause transition.");
+                    return;
+                }
+
+                bluez.resetAudioProfile(
+                    connection.address,
+                    transport.nowMs() + operation_timeout_ms,
+                    &self.failure,
+                ) catch {
+                    self.players.resumePlayers() catch {
+                        self.players.clear();
+                    };
+                    self.warnMedia("A2DP profile recovery failed because BlueZ could not reset the selected AirPods audio profile.");
+                    self.failure.len = 0;
+                    return;
+                };
+                self.players.resumePlayers() catch {
+                    self.players.clear();
+                    self.warnMedia("A2DP profile recovery could not resume the MPRIS players that airpodsctl paused.");
+                    return;
+                };
+
+                state = bluez.waitForMediaTransport(
+                    connection.address,
+                    transport.nowMs() + operation_timeout_ms,
+                    &self.failure,
+                ) catch {
+                    self.warnMedia("A2DP profile recovery completed, but BlueZ transport activation could not be observed safely.");
+                    self.failure.len = 0;
+                    return;
+                };
+                if (state.isUsable()) {
+                    support.log(
+                        .info,
+                        "A2DP profile recovery succeeded because BlueZ reports the AirPods transport as active after owned MPRIS playback resumed.",
+                        .{},
+                    );
+                } else {
+                    support.log(
+                        .warn,
+                        "A2DP profile recovery did not produce usable audio because BlueZ still reports the AirPods transport as '{s}'.",
+                        .{state.name()},
+                    );
+                }
+            },
+        }
+    }
+
+    fn handleControllerEvent(self: *Server, event: controller.Event) void {
+        switch (event) {
+            .wear => |report| {
+                const owns_media = self.players.hasOwnership();
+                const evaluation = self.wear.evaluateWear(report, owns_media);
+                switch (evaluation.reason) {
+                    .disabled => support.log(
+                        .debug,
+                        "Ignored the wear update because pause-on-removal is disabled.",
+                        .{},
+                    ),
+                    .incomplete_state => support.log(
+                        .info,
+                        "Suppressed pause-on-removal and reset its baseline because at least one protocol role has an unknown wear state.",
+                        .{},
+                    ),
+                    .baseline => support.log(
+                        .info,
+                        "Recorded {d} in-ear earbuds as the baseline because the first complete wear snapshot after connecting or resetting must never change media.",
+                        .{evaluation.current_count.?},
+                    ),
+                    .unchanged => support.log(
+                        .debug,
+                        "Took no media action because the in-ear count remained {d}, so no policy threshold was crossed.",
+                        .{evaluation.current_count.?},
+                    ),
+                    .pause_threshold => support.log(
+                        .debug,
+                        "Selected pause because the in-ear count changed from {d} to {d}, crossing the '{s}' removal threshold ({s}).",
+                        .{
+                            evaluation.previous_count.?,
+                            evaluation.current_count.?,
+                            @tagName(self.wear.mode),
+                            if (self.wear.mode == .one) "2 to fewer than 2" else "at least 1 to 0",
+                        },
+                    ),
+                    .resume_threshold => support.log(
+                        .debug,
+                        "Selected resume because the in-ear count changed from {d} to {d}, crossing the '{s}' insertion threshold ({s}), and airpodsctl owns confirmed MPRIS pauses.",
+                        .{
+                            evaluation.previous_count.?,
+                            evaluation.current_count.?,
+                            @tagName(self.wear.mode),
+                            if (self.wear.mode == .one) "fewer than 2 to 2" else "0 to at least 1",
+                        },
+                    ),
+                    .resume_not_owned => support.log(
+                        .info,
+                        "Did not resume media after the in-ear count changed from {d} to {d}, crossing the '{s}' insertion threshold, because airpodsctl owns no confirmed MPRIS pause transitions.",
+                        .{
+                            evaluation.previous_count.?,
+                            evaluation.current_count.?,
+                            @tagName(self.wear.mode),
+                        },
+                    ),
+                    .transition_irrelevant => support.log(
+                        .debug,
+                        "Took no media action because the in-ear count changed from {d} to {d} without crossing the '{s}' policy threshold.",
+                        .{
+                            evaluation.previous_count.?,
+                            evaluation.current_count.?,
+                            @tagName(self.wear.mode),
+                        },
+                    ),
+                }
+
+                switch (evaluation.decision) {
+                    .none => {},
+                    .pause_media => {
+                        support.log(
+                            .info,
+                            "Pausing eligible MPRIS players because the in-ear count changed from {d} to {d}, crossing the enabled '{s}' removal threshold.",
+                            .{
+                                evaluation.previous_count.?,
+                                evaluation.current_count.?,
+                                @tagName(self.wear.mode),
+                            },
+                        );
+                        self.players.pausePlayers() catch {
+                            self.warnMedia("MPRIS players could not be paused because the user D-Bus operation failed; no automatic-resume ownership was recorded.");
+                            return;
+                        };
+                        if (self.players.hasOwnership()) {
+                            support.log(
+                                .info,
+                                "Automatic resume is armed because at least one MPRIS player confirmed its transition from Playing to Paused.",
+                                .{},
+                            );
+                        } else {
+                            support.log(
+                                .info,
+                                "Automatic resume is not armed because no eligible MPRIS player confirmed a transition from Playing to Paused.",
+                                .{},
+                            );
+                        }
+                    },
+                    .resume_media => {
+                        support.log(
+                            .info,
+                            "Resuming owned MPRIS players because the in-ear count changed from {d} to {d}, crossing the enabled '{s}' insertion threshold, and airpodsctl still owns their confirmed pause transitions.",
+                            .{
+                                evaluation.previous_count.?,
+                                evaluation.current_count.?,
+                                @tagName(self.wear.mode),
+                            },
+                        );
+                        self.players.resumePlayers() catch {
+                            self.players.clear();
+                            self.warnMedia("MPRIS players could not be resumed because the user D-Bus operation failed; stale automatic-resume ownership was cleared.");
+                            return;
+                        };
+                        support.log(
+                            .info,
+                            "Automatic resume completed because every still-eligible MPRIS player was evaluated and ownership was cleared.",
+                            .{},
+                        );
+                    },
+                }
+            },
+            .routing => |status| {
+                self.publishRouting(true);
+                if (self.switching.service_owns and status.owner != .linux) {
+                    support.log(
+                        .info,
+                        "Cleared Linux switching ownership because an AirPods routing notification reports that Linux no longer owns routing arbitration.",
+                        .{},
+                    );
+                    self.switching.remoteTakeover();
+                    self.transport_recovery_pending = false;
+                    self.transport_recovery_explicit = false;
+                }
+            },
+            .release_requested => {
+                self.release_requested = true;
+                self.publishRouting(true);
+                self.release_requested = false;
+            },
+            .listening_mode, .battery, .routing_relay => {},
+        }
+    }
+
+    fn observeControllerEvent(context: ?*anyopaque, event: controller.Event) void {
+        const self: *Server = @ptrCast(@alignCast(context.?));
+        self.handleControllerEvent(event);
+    }
+
+    fn connect(self: *Server) !void {
+        support.log(
+            .debug,
+            "Looking for connected AirPods because the service needs a live control session for client requests and enabled policies.",
+            .{},
+        );
+        const deadline_ms = transport.nowMs() + operation_timeout_ms;
+        const address = try bluez.discover(self.requested_address, &self.failure);
+        const fd = try bluez.openControlChannel(address, deadline_ms, &self.failure);
+        errdefer bluez.close(fd);
+        support.log(
+            .debug,
+            "The Bluetooth control channel is connected because the selected AirPods accepted the AACP L2CAP connection.",
+            .{},
+        );
+
+        var control = controller.Controller{
+            .session = try aacp.Session.initialize(
+                fd,
+                deadline_ms,
+                initialization_delay_ms,
+                &self.failure,
+            ),
+            .local_address = try bluez.localAddress(fd, &self.failure),
+        };
+        support.log(
+            .info,
+            "The AirPods control session is ready because its handshake and notification subscription completed.",
+            .{},
+        );
+        if (self.switching.mode == .mpris) {
+            support.log(
+                .debug,
+                "Requesting initial AirPods routing state because automatic switching must prove multipoint readiness and remote idleness.",
+                .{},
+            );
+            try control.requestRoutingStatus(deadline_ms);
+        }
+
+        self.connection = .{
+            .fd = fd,
+            .address = address,
+            .control = control,
+        };
+        self.event_generation += 1;
+        self.publishRouting(true);
+        self.reconnect_at_ms = 0;
+        self.reconnect_delay_ms = idle_poll_ms;
+        support.log(
+            .debug,
+            "The service connection is usable because Bluetooth, AACP, local-address discovery, and required routing initialization succeeded.",
+            .{},
+        );
+        _ = self.mediaTransportState("initializing the AirPods control session");
+    }
+
+    fn ensureConnection(self: *Server) void {
+        if (self.connection != null or !self.needsPersistentConnection() or
+            transport.nowMs() < self.reconnect_at_ms)
+        {
+            return;
+        }
+        self.connect() catch {
+            support.log(
+                .warn,
+                "The AirPods reconnect attempt failed because discovery or control-session initialization did not complete; retrying in {d} ms.",
+                .{self.reconnect_delay_ms},
+            );
+            self.reconnect_at_ms = transport.nowMs() + self.reconnect_delay_ms;
+            self.reconnect_delay_ms = @min(self.reconnect_delay_ms * 2, max_reconnect_delay_ms);
+            self.failure.len = 0;
+        };
+    }
+
+    fn performSwitching(self: *Server, action: switching_policy.Action) void {
+        if (action == .none) return;
+        support.emit(
+            .info,
+            if (action == .take)
+                "Requesting AirPods routing ownership because a new MPRIS Playing edge satisfied the multipoint, remote-idle, and suppression checks."
+            else
+                "Releasing AirPods routing ownership because all tracked MPRIS players remained idle for 30 seconds after an automatic take.",
+        );
+        const deadline_ms = transport.nowMs() + operation_timeout_ms;
+        const connection = if (self.connection) |*value| value else {
+            self.switching.operationFailed();
+            support.log(
+                .warn,
+                "Automatic switching was suppressed because the AirPods control connection disappeared before the ownership request could be sent.",
+                .{},
+            );
+            return;
+        };
+        _ = connection.control.runWithObserver(.{ .switching = .{
+            .action = if (action == .take) .take else .release,
+        } }, deadline_ms, .{
+            .context = self,
+            .callback = observeControllerEvent,
+        }) catch {
+            self.switching.operationFailed();
+            self.warnMedia("Automatic switching was suppressed because the AirPods did not return a valid ownership acknowledgement before the operation deadline.");
+            self.failure.len = 0;
+            self.disconnect();
+            return;
+        };
+
+        if (action == .take) {
+            self.switching.takeSucceeded(transport.nowMs());
+            self.reportTakeTransport("the automatic ownership acknowledgement");
+            self.scheduleTransportRecovery(false);
+        } else {
+            self.switching.releaseSucceeded();
+            self.transport_recovery_pending = false;
+            self.transport_recovery_explicit = false;
+        }
+        support.emit(
+            .info,
+            if (action == .take)
+                "Linux now owns AirPods routing arbitration because the ownership acknowledgement confirmed the automatic take."
+            else
+                "Linux released AirPods routing arbitration because the ownership acknowledgement confirmed the automatic release.",
+        );
+    }
+
+    fn handlePlayback(self: *Server, update: media.PlaybackUpdate) void {
+        if (self.logged_playing == null or self.logged_playing.? != update.playing) {
+            self.logged_playing = update.playing;
+            support.emit(
+                .debug,
+                if (update.playing)
+                    "MPRIS playback is active because at least one tracked player reports Playing."
+                else
+                    "MPRIS playback is idle because no tracked player reports Playing.",
+            );
+        }
+
+        const previous_release = self.switching.release_at_ms;
+        const eligibility = self.switchingEligibility();
+        const action = self.switching.updatePlayback(
+            transport.nowMs(),
+            update.playing,
+            update.play_edge,
+            eligibility,
+        );
+        if (update.play_edge) support.log(
+            .debug,
+            "Evaluated a new MPRIS Playing edge: multipoint {s}, remote host {s}; decision '{s}' because automatic take requires both conditions and no active suppression.",
+            .{
+                if (eligibility.multipoint_ready) "ready" else "not ready",
+                if (eligibility.remote_idle) "idle" else "active or unknown",
+                @tagName(action),
+            },
+        );
+        if (previous_release == null and self.switching.release_at_ms != null) {
+            support.log(
+                .info,
+                "Scheduled AirPods ownership release in 30 seconds because Linux owns an automatic take and every tracked MPRIS player is idle.",
+                .{},
+            );
+        } else if (previous_release != null and self.switching.release_at_ms == null and update.playing) {
+            support.log(
+                .info,
+                "Cancelled the pending AirPods ownership release because MPRIS playback became active before the 30-second idle deadline.",
+                .{},
+            );
+        }
+        self.performSwitching(action);
+    }
+
+    fn ensurePlayback(self: *Server) void {
+        if ((self.switching.mode == .off and !self.switching.service_owns) or
+            transport.nowMs() < self.media_retry_at_ms)
+        {
+            return;
+        }
+
+        const update = self.players.monitorPlayback() catch {
+            if (self.media_available == null or self.media_available.?) support.log(
+                .warn,
+                "MPRIS monitoring is unavailable because the user D-Bus connection or playback refresh failed; retrying in {d} ms.",
+                .{idle_poll_ms},
+            );
+            self.media_available = false;
+            self.logged_playing = null;
+            self.media_retry_at_ms = transport.nowMs() + idle_poll_ms;
+            if (self.switching.service_owns) {
+                _ = self.switching.updatePlayback(
+                    transport.nowMs(),
+                    false,
+                    false,
+                    .{ .multipoint_ready = false, .remote_idle = false },
+                );
+            }
+            return;
+        };
+        if (self.media_available == null or !self.media_available.?) {
+            support.log(
+                .debug,
+                "MPRIS monitoring is available because the user D-Bus subscriptions and initial playback snapshot succeeded.",
+                .{},
+            );
+        }
+        self.media_available = true;
+        self.media_retry_at_ms = 0;
+        self.handlePlayback(update);
+    }
+
+    fn replyFailure(
+        self: *Server,
+        client: c_int,
+        version: ipc.ProtocolVersion,
+    ) void {
+        var packet: [512]u8 = undefined;
+        var ignored = support.ErrorMessage{};
+
+        ipc.sendPacket(
+            client,
+            ipc.encodeFailureForVersion(&packet, self.failure.text(), version),
+            transport.nowMs() + ipc_reply_timeout_ms,
+            &ignored,
+        ) catch {};
+    }
+
+    fn handleClient(self: *Server, client: c_int) void {
+        const deadline_ms = transport.nowMs() + operation_timeout_ms;
+        var packet: [512]u8 = undefined;
+        const request = ipc.decodeRequest(
+            ipc.receivePacket(client, &packet, deadline_ms, &self.failure) catch {
+                support.log(
+                    .warn,
+                    "Rejected a session client because its request could not be received before the bounded IPC deadline.",
+                    .{},
+                );
+                self.replyFailure(client, .v1);
+                return;
+            },
+        ) catch {
+            self.failure.set("session client sent an invalid request", .{});
+            support.log(
+                .warn,
+                "Rejected a session client because its packet did not decode as a supported versioned operation.",
+                .{},
+            );
+            self.replyFailure(client, .v1);
+            return;
+        };
+        support.log(
+            .debug,
+            "Accepted the session client's '{s}' request because its IPC version, operation, and bounded payload were valid.",
+            .{request.operation.name()},
+        );
+
+        if (self.connection == null) self.connect() catch {
+            support.log(
+                .warn,
+                "The session client's '{s}' request could not run because no AirPods control session could be initialized.",
+                .{request.operation.name()},
+            );
+            self.replyFailure(client, request.version);
+            return;
+        };
+        if (request.requested_address) |requested| {
+            if (!std.ascii.eqlIgnoreCase(requested, &self.connection.?.address.text)) {
+                self.failure.set(
+                    "session owns AirPods {s}, not {s}",
+                    .{ self.connection.?.address.text, requested },
+                );
+                support.log(
+                    .warn,
+                    "Rejected the session client because its requested device does not match the AirPods pair owned by this service.",
+                    .{},
+                );
+                self.replyFailure(client, request.version);
+                return;
+            }
+        }
+
+        const result = self.connection.?.control.runWithObserver(request.operation, deadline_ms, .{
+            .context = self,
+            .callback = observeControllerEvent,
+        }) catch |err| {
+            support.log(
+                .warn,
+                "The session client's '{s}' request failed because the AirPods protocol exchange did not produce a valid acknowledgement before the deadline.",
+                .{request.operation.name()},
+            );
+            self.replyFailure(client, request.version);
+
+            // A protocol failure leaves the stream and cached state unreliable; let policy recovery reconnect it.
+            if (err != error.PolicyDenied) self.disconnect();
+            return;
+        };
+        if (request.operation == .switching) switch (request.operation.switching.action) {
+            .status => {},
+            .take, .take_media => {
+                if (self.switching.mode != .external) self.switching.takeSucceeded(transport.nowMs());
+                self.reportTakeTransport("the explicit ownership acknowledgement");
+                self.scheduleTransportRecovery(true);
+                support.log(
+                    .debug,
+                    "Recorded Linux switching ownership because the explicit take received a valid AirPods acknowledgement.",
+                    .{},
+                );
+            },
+            .release => {
+                self.switching.releaseSucceeded();
+                self.transport_recovery_pending = false;
+                self.transport_recovery_explicit = false;
+                support.log(
+                    .debug,
+                    "Cleared Linux switching ownership because the explicit release received a valid AirPods acknowledgement.",
+                    .{},
+                );
+            },
+        };
+        ipc.sendPacket(client, ipc.encodeResultForVersion(
+            &packet,
+            result,
+            request.version,
+        ), transport.nowMs() + ipc_reply_timeout_ms, &self.failure) catch {
+            support.log(
+                .warn,
+                "The '{s}' result could not be returned because the session client closed or stopped reading its local socket.",
+                .{request.operation.name()},
+            );
+            return;
+        };
+        support.log(
+            .debug,
+            "Completed the session client's '{s}' request because its typed result was encoded and sent successfully.",
+            .{request.operation.name()},
+        );
+    }
+
+    fn run(self: *Server, listener: c_int) Error!void {
+        // Connect eagerly for fast first use, but remain available while the AirPods are absent.
+        self.connect() catch {
+            support.log(
+                .warn,
+                "The initial AirPods connection is unavailable because discovery or control-session initialization failed; the session listener remains ready for later requests.",
+                .{},
+            );
+            self.failure.len = 0;
+            if (self.needsPersistentConnection()) {
+                self.reconnect_at_ms = transport.nowMs() + self.reconnect_delay_ms;
+                support.log(
+                    .info,
+                    "Retrying the AirPods connection in {d} ms because enabled host policies require continuous AACP wear or routing notifications.",
+                    .{self.reconnect_delay_ms},
+                );
+            }
+        };
+
+        while ((@as(*volatile c.sig_atomic_t, &stop_requested)).* == 0) {
+            self.ensureConnection();
+            // Playback policy is owned by the external controller.
+            self.ensureTransport();
+            var descriptors = [_]c.struct_pollfd{
+                .{ .fd = listener, .events = c.POLLIN, .revents = 0 },
+                .{
+                    .fd = if (self.connection) |connection| connection.fd else -1,
+                    .events = c.POLLIN,
+                    .revents = 0,
+                },
+                .{
+                    .fd = self.players.fd(),
+                    .events = self.players.events(),
+                    .revents = 0,
+                },
+            };
+            if (c.poll(&descriptors, descriptors.len, idle_poll_ms) < 0) {
+                if (support.lastErrno() == c.EINTR) continue;
+                self.failure.setSystem("session service poll failed", support.lastErrno());
+                return error.ServerFailure;
+            }
+
+            // Drain unsolicited AACP events here so feature handlers never race to read the channel.
+            if (descriptors[1].revents & c.POLLIN != 0) {
+                self.connection.?.control.session.channel.deadline_ms = transport.nowMs() + operation_timeout_ms;
+                const event = self.connection.?.control.receiveOne() catch |err| {
+                    support.log(
+                        .warn,
+                        "AACP session error {s}: {s}",
+                        .{ @errorName(err), self.failure.text() },
+                    );
+                    self.disconnect();
+                    continue;
+                };
+                if (event) |value| self.handleControllerEvent(value);
+            } else if (descriptors[1].revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0) {
+                support.log(
+                    .warn,
+                    "Discarding the AirPods control session because poll reported an error or hangup on the Bluetooth channel.",
+                    .{},
+                );
+                self.disconnect();
+            }
+            if (descriptors[2].revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0) {
+                self.players.deinit();
+                self.warnMedia("MPRIS monitoring was reset because poll reported an error or hangup on the user D-Bus connection; retrying after the bounded media backoff.");
+                self.media_available = false;
+                self.logged_playing = null;
+                self.media_retry_at_ms = transport.nowMs() + idle_poll_ms;
+            } else {
+                // sd-bus can have queued messages while its requested poll event mask is zero.
+                self.players.dispatch() catch {
+                    self.warnMedia("MPRIS monitoring was reset because the user D-Bus dispatcher failed; retrying after the bounded media backoff.");
+                    self.media_available = false;
+                    self.logged_playing = null;
+                    self.media_retry_at_ms = transport.nowMs() + idle_poll_ms;
+                };
+            }
+            // Playback policy is owned by the external controller.
+            if (descriptors[0].revents & c.POLLIN != 0) {
+                // Handle one bounded request at a time so setter acknowledgements remain ordered.
+                const client = ipc.acceptClient(listener, &self.failure) catch {
+                    support.log(
+                        .warn,
+                        "Rejected a session client because accept or same-user credential validation failed.",
+                        .{},
+                    );
+                    continue;
+                };
+                defer _ = c.close(client);
+                self.handleClient(client);
+            }
+            if (self.switching.mode != .external) self.performSwitching(self.switching.tick(transport.nowMs()));
+        }
+        support.log(.info, "Stopping the session service because SIGINT or SIGTERM requested an orderly shutdown.", .{});
+    }
+};
+
+pub fn run(configuration: cli.ServeCommand, failure: *support.ErrorMessage) Error!void {
+    support.log(
+        .info,
+        "Starting the session service with pause-on-removal '{s}' and automatic switching '{s}' because those policies were selected on the command line.",
+        .{ @tagName(configuration.pause_on_removal), @tagName(configuration.auto_switch) },
+    );
+    const path = ipc.getSocketPath(failure) catch return error.ServerFailure;
+    const listener = ipc.openListener(&path, failure) catch return error.ServerFailure;
+    defer _ = c.close(listener);
+    defer _ = c.unlink(path.sentinel().ptr);
+    support.log(
+        .debug,
+        "The session listener is ready because its owner-only SOCK_SEQPACKET socket was bound with same-user peer validation.",
+        .{},
+    );
+
+    stop_requested = 0;
+    _ = c.signal(c.SIGINT, handleSignal);
+    _ = c.signal(c.SIGTERM, handleSignal);
+
+    var service = Server{
+        .requested_address = configuration.requested_address,
+        .wear = .{ .mode = configuration.pause_on_removal },
+        .switching = .{ .mode = configuration.auto_switch },
+    };
+    defer {
+        service.disconnect();
+        service.players.deinit();
+    }
+    service.run(listener) catch {
+        failure.* = service.failure;
+        return error.ServerFailure;
+    };
+}

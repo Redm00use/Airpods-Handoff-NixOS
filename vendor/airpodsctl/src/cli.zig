@@ -1,0 +1,345 @@
+const std = @import("std");
+const battery = @import("battery");
+const command = @import("command");
+const noise_control = @import("noise_control");
+const support = @import("support");
+const switching_policy = @import("switching_policy");
+
+pub const usage =
+    \\Usage: airpodsctl [-v] [--device MAC] COMMAND
+    \\       airpodsctl [-v] [--device MAC] toggle [MODE...]
+    \\       airpodsctl [-v] [--device MAC] battery [COMPONENT]
+    \\       airpodsctl [-v] [--device MAC] wear-status
+    \\       airpodsctl [-v] [--device MAC] switching status|release
+    \\       airpodsctl [-v] [--device MAC] switching take [--force] | take-media
+    \\       airpodsctl [-v] [--device MAC] serve [--pause-on-removal=POLICY] [--auto-switch=MODE]
+    \\
+    \\Commands:
+    \\  status        Print the current listening mode
+    \\  anc           Enable active noise cancellation
+    \\  off           Disable all listening-mode processing
+    \\  transparency  Pass surrounding sound through
+    \\  adaptive      Adjust noise control for the surroundings
+    \\  toggle [MODE...]
+    \\                Cycle through MODEs in order (defaults to anc off)
+    \\  battery [COMPONENT]
+    \\                Print all battery readings or one percentage
+    \\  wear-status   Print the latest primary and secondary wear state
+    \\  switching status|take|release
+    \\                Inspect or change multipoint audio ownership
+    \\  serve         Keep an AACP session available to later commands
+    \\
+    \\Toggle modes:
+    \\  anc, off, transparency, adaptive
+    \\
+    \\Battery components:
+    \\  left, right
+    \\
+    \\Pause policies:
+    \\  one, both, off
+    \\
+    \\Auto-switch modes:
+    \\  mpris, off
+    \\
+    \\Options:
+    \\  -v, --verbose     Log informational diagnostics to standard error
+    \\  -vv               Also log internal decision and protocol stages
+    \\      --log-level LEVEL
+    \\                    Set error, warn, info, or debug logging
+    \\      --color WHEN  Color log levels: auto, always, or never
+    \\  -d, --device MAC  Select connected AirPods by Bluetooth address
+    \\      --session     Require a running session service
+    \\      --direct      Bypass the session service
+    \\      --pause-on-removal POLICY
+    \\                    Pause MPRIS players while serving (default: off)
+    \\      --force       Allow switching take to interrupt remote activity
+    \\      --auto-switch MODE
+    \\                    Take on safe MPRIS play edges while serving (default: off)
+    \\  -h, --help        Show this help
+    \\  -V, --version     Show the program version
+    \\
+;
+
+pub const Backend = enum {
+    automatic,
+    session,
+    direct,
+};
+
+pub const Command = struct {
+    requested_address: ?[]const u8,
+    backend: Backend,
+    operation: command.Operation,
+    log_level: support.LogLevel = .warn,
+    color: support.ColorMode = .auto,
+};
+
+pub const ServeCommand = struct {
+    requested_address: ?[]const u8,
+    pause_on_removal: command.PauseOnRemoval,
+    auto_switch: switching_policy.Mode,
+    log_level: support.LogLevel = .warn,
+    color: support.ColorMode = .auto,
+};
+
+pub const Invocation = union(enum) {
+    help,
+    version,
+    usage,
+    serve: ServeCommand,
+    execute: Command,
+};
+
+fn parsePauseOnRemoval(value: []const u8) ?command.PauseOnRemoval {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "one")) return .one;
+    if (std.mem.eql(u8, value, "both")) return .both;
+    return null;
+}
+
+fn parseAutoSwitch(value: []const u8) ?switching_policy.Mode {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "mpris")) return .mpris;
+    if (std.mem.eql(u8, value, "external")) return .external;
+    return null;
+}
+
+fn parseLogLevel(value: []const u8) ?support.LogLevel {
+    if (std.mem.eql(u8, value, "error")) return .@"error";
+    if (std.mem.eql(u8, value, "warn")) return .warn;
+    if (std.mem.eql(u8, value, "info")) return .info;
+    if (std.mem.eql(u8, value, "debug")) return .debug;
+    return null;
+}
+
+fn parseColorMode(value: []const u8) ?support.ColorMode {
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    if (std.mem.eql(u8, value, "always")) return .always;
+    if (std.mem.eql(u8, value, "never")) return .never;
+    return null;
+}
+
+pub fn parseInvocation(arguments: []const [:0]const u8) Invocation {
+    // Keep an overflow slot so a fifth toggle mode is rejected by mode-count validation.
+    var positional: [command.max_toggle_modes + 2][]const u8 = undefined;
+    var positional_count: usize = 0;
+    var requested_address: ?[]const u8 = null;
+    var pause_on_removal: ?command.PauseOnRemoval = null;
+    var auto_switch: ?switching_policy.Mode = null;
+    var force = false;
+    var verbosity: u8 = 0;
+    var requested_log_level: ?support.LogLevel = null;
+    var color: ?support.ColorMode = null;
+    var backend: Backend = .automatic;
+    var options_ended = false;
+    var index: usize = 1;
+
+    // Scan the whole command line so options work on either side of the command until `--`.
+    while (index < arguments.len) : (index += 1) {
+        const argument: []const u8 = arguments[index];
+        if (!options_ended and std.mem.eql(u8, argument, "--")) {
+            options_ended = true;
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--help")) return .help;
+        if (!options_ended and std.mem.eql(u8, argument, "--version")) return .version;
+        if (!options_ended and std.mem.eql(u8, argument, "--verbose")) {
+            verbosity = @min(verbosity + 1, 2);
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--log-level")) {
+            if (requested_log_level != null) return .usage;
+            index += 1;
+            if (index == arguments.len) return .usage;
+            requested_log_level = parseLogLevel(arguments[index]) orelse return .usage;
+            continue;
+        }
+        if (!options_ended and std.mem.startsWith(u8, argument, "--log-level=")) {
+            if (requested_log_level != null) return .usage;
+            requested_log_level = parseLogLevel(argument["--log-level=".len..]) orelse return .usage;
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--color")) {
+            if (color != null) return .usage;
+            index += 1;
+            if (index == arguments.len) return .usage;
+            color = parseColorMode(arguments[index]) orelse return .usage;
+            continue;
+        }
+        if (!options_ended and std.mem.startsWith(u8, argument, "--color=")) {
+            if (color != null) return .usage;
+            color = parseColorMode(argument["--color=".len..]) orelse return .usage;
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--device")) {
+            index += 1;
+            if (index == arguments.len) return .usage;
+            requested_address = arguments[index];
+            continue;
+        }
+        if (!options_ended and std.mem.startsWith(u8, argument, "--device=")) {
+            requested_address = argument["--device=".len..];
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--pause-on-removal")) {
+            if (pause_on_removal != null) return .usage;
+            index += 1;
+            if (index == arguments.len) return .usage;
+            pause_on_removal = parsePauseOnRemoval(arguments[index]) orelse return .usage;
+            continue;
+        }
+        if (!options_ended and std.mem.startsWith(u8, argument, "--pause-on-removal=")) {
+            if (pause_on_removal != null) return .usage;
+            pause_on_removal = parsePauseOnRemoval(argument["--pause-on-removal=".len..]) orelse return .usage;
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--auto-switch")) {
+            if (auto_switch != null) return .usage;
+            index += 1;
+            if (index == arguments.len) return .usage;
+            auto_switch = parseAutoSwitch(arguments[index]) orelse return .usage;
+            continue;
+        }
+        if (!options_ended and std.mem.startsWith(u8, argument, "--auto-switch=")) {
+            if (auto_switch != null) return .usage;
+            auto_switch = parseAutoSwitch(argument["--auto-switch=".len..]) orelse return .usage;
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--session")) {
+            if (backend != .automatic) return .usage;
+            backend = .session;
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--direct")) {
+            if (backend != .automatic) return .usage;
+            backend = .direct;
+            continue;
+        }
+        if (!options_ended and std.mem.eql(u8, argument, "--force")) {
+            if (force) return .usage;
+            force = true;
+            continue;
+        }
+        if (!options_ended and std.mem.startsWith(u8, argument, "--")) return .usage;
+        if (!options_ended and argument.len > 1 and argument[0] == '-') {
+            var short_index: usize = 1;
+            while (short_index < argument.len) : (short_index += 1) {
+                switch (argument[short_index]) {
+                    'h' => return .help,
+                    'V' => return .version,
+                    'v' => verbosity = @min(verbosity + 1, 2),
+                    'd' => {
+                        if (short_index + 1 < argument.len) {
+                            requested_address = argument[short_index + 1 ..];
+                        } else {
+                            index += 1;
+                            if (index == arguments.len) return .usage;
+                            requested_address = arguments[index];
+                        }
+                        break;
+                    },
+                    else => return .usage,
+                }
+            }
+            continue;
+        }
+        if (positional_count == positional.len) return .usage;
+        positional[positional_count] = argument;
+        positional_count += 1;
+    }
+
+    if (verbosity != 0 and requested_log_level != null) return .usage;
+    const log_level = requested_log_level orelse switch (verbosity) {
+        0 => support.LogLevel.warn,
+        1 => .info,
+        else => .debug,
+    };
+
+    if (positional_count == 0) return .usage;
+    if (std.mem.eql(u8, positional[0], "serve")) {
+        if (positional_count != 1 or backend != .automatic or force) return .usage;
+        return .{ .serve = .{
+            .requested_address = requested_address,
+            .pause_on_removal = pause_on_removal orelse .off,
+            .auto_switch = auto_switch orelse .off,
+            .log_level = log_level,
+            .color = color orelse .auto,
+        } };
+    }
+    if (pause_on_removal != null or auto_switch != null) return .usage;
+    if (std.mem.eql(u8, positional[0], "switching")) {
+        if (positional_count != 2) return .usage;
+        const action: command.SwitchingAction = if (std.mem.eql(u8, positional[1], "status"))
+            .status
+        else if (std.mem.eql(u8, positional[1], "take"))
+            .take
+        else if (std.mem.eql(u8, positional[1], "take-media"))
+            .take_media
+        else if (std.mem.eql(u8, positional[1], "release"))
+            .release
+        else
+            return .usage;
+        if (force and action != .take) return .usage;
+        if (action != .status) {
+            if (backend == .direct) return .usage;
+            backend = .session;
+        }
+        return .{ .execute = .{
+            .requested_address = requested_address,
+            .backend = backend,
+            .operation = .{ .switching = .{ .action = action, .force = force } },
+            .log_level = log_level,
+            .color = color orelse .auto,
+        } };
+    }
+    if (force) return .usage;
+    if (std.mem.eql(u8, positional[0], "battery")) {
+        if (positional_count > 2) return .usage;
+        return .{ .execute = .{
+            .requested_address = requested_address,
+            .backend = backend,
+            .operation = .{ .battery = if (positional_count == 2)
+                battery.Component.parse(positional[1]) orelse return .usage
+            else
+                null },
+            .log_level = log_level,
+            .color = color orelse .auto,
+        } };
+    }
+    if (std.mem.eql(u8, positional[0], "wear-status")) {
+        if (positional_count != 1) return .usage;
+        return .{ .execute = .{
+            .requested_address = requested_address,
+            .backend = backend,
+            .operation = .wear_status,
+            .log_level = log_level,
+            .color = color orelse .auto,
+        } };
+    }
+
+    const action = noise_control.Action.parse(positional[0]) orelse return .usage;
+    const toggle_mode_count = positional_count - 1;
+    if ((action != .toggle and toggle_mode_count != 0) or toggle_mode_count > command.max_toggle_modes) {
+        return .usage;
+    }
+
+    var noise_command = command.NoiseControl{
+        .action = action,
+        .toggle_mode_count = toggle_mode_count,
+    };
+    for (positional[1..positional_count], 0..) |value, mode_index| {
+        noise_command.toggle_modes[mode_index] = noise_control.Mode.parse(value) orelse return .usage;
+
+        // Duplicate entries make a cycle position ambiguous and provide no useful behavior.
+        for (noise_command.toggle_modes[0..mode_index]) |previous| {
+            if (previous == noise_command.toggle_modes[mode_index]) return .usage;
+        }
+    }
+    return .{ .execute = .{
+        .requested_address = requested_address,
+        .backend = backend,
+        .operation = .{ .noise_control = noise_command },
+        .log_level = log_level,
+        .color = color orelse .auto,
+    } };
+}
