@@ -6,18 +6,20 @@ This reuses a locally extended MIT-licensed `hacel/airpodsctl` controller. A Pyt
 
 ## Status
 
-Confirmed on one setup: paused iPhone → Cider playback on Linux, return to iPhone, and automatic Cider pause. Existing iPhone calls were correctly reported and guarded. Notification exclusion, race handling, sleep/resume and recovery have automated coverage, not a complete hardware matrix.
+Version 0.3 protects active Linux calls/media rather than auto-pausing a local player when iPhone requests ownership. Duplex Discord/Telegram streams and explicitly tagged communication sessions are tracked, including silence/mute grace. A conservative PipeWire fallback covers known media applications and Music/Movie/Video/Game streams without MPRIS; notifications and startup baselines do not create takeover intent.
 
-**Taking over ongoing iPhone music is implemented with a guarded `take-media` operation, but is not yet hearing-tested.** Calls and unknown source types are rejected by the controller after a fresh status exchange. No unconditional `--force` is used.
+New playback/call intent can request one controller-guarded `take-media` over remote music. A proven local session can also request one bounded recovery after an autonomous iPhone takeover; repeated contention stops at `LOCAL_CONTESTED`. The automatic path does not use unconditional `take --force`. The controller refreshes status and rejects calls/unknown types before changing ownership.
 
-A bounded suspend/resume of the existing A2DP sink can recover a stalled transport without disconnecting Bluetooth or cycling profiles. Transport errors and delayed starts have occurred; this is not a stable-release claim. Other AirPods models, adapters, firmware and ARM hardware remain unverified.
+A2DP transport state is insufficient evidence of working audio. Paused/init output links into the matching AirPods sink are repaired once per link generation, without rebuilding the microphone/effect chain or disconnecting Bluetooth. Old intents/focus are discarded on sleep; resume refreshes the graph. There are 120 Python regression tests plus controller core tests.
+
+Manual repair of the specific stalled output links was hearing-confirmed on one setup; the automatic repair was observed in logs. Full repeated hardware cycles, PC calls, sleep/resume, other models/adapters and ARM remain unverified. This does not implement Apple's closed cross-device arbiter or guarantee interruption-free ownership. It is an experimental project, not a stable-release claim.
 
 ## Install
 
-Add this local checkout as a flake input, or use `github:OWNER/airpods-handoff-nixos` **after the repository has been published**:
+Use the published repository as a flake input:
 
 ```nix
-inputs.airpods-handoff.url = "path:/home/alice/Documents/airpods-handoff-nixos";
+inputs.airpods-handoff.url = "github:Redm00use/Airpods-Handoff-NixOS";
 ```
 
 Add `inputs.airpods-handoff.nixosModules.default` to your existing NixOS module list and configure:
@@ -60,3 +62,13 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 Hardware tests and limitations: [manual matrix](docs/manual-tests.ru.md). An ownership ACK or active transport is not an acoustic test.
 
 MIT; vendored controller retains its upstream license. See [notices](THIRD_PARTY_NOTICES.md).
+
+Hardware update: Cider-over-iPhone and a Discord call recovery were hearing-confirmed on one setup; brief switching interruptions remain possible. See [verification](docs/verification.md).
+
+## Manual controls and Noctalia
+
+`airpods-handoffctl status|watch|pin|auto|return` uses a user-only UNIX socket. Pin preferences persist, but pinning is not Apple's firmware-level lock. A repeated autonomous takeover can require manual return rather than starting a command loop.
+
+The optional [Noctalia 5.2 / Luau API 24 panel](integrations/noctalia/README.md) displays source/call/recovery/conflict and exposes the same controls. It does not depend on personal scripts or addresses. Status strings are currently Russian.
+
+Recovery now reacts immediately to a known sink error and repairs late-arriving graph edges within the same attempt. The extra 300ms restore delay was removed only for a proven local session and typed remote media. An initial optimized sample showed 264ms from ownership ACK to observed graph readiness; the user initially perceived little difference. The latest policy change is not an acoustic latency guarantee.

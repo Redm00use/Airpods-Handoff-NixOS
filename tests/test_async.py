@@ -1,5 +1,5 @@
 import os
-os.environ['AIRPODS_DEVICE']='AA:BB:CC:DD:EE:FF'
+os.environ.setdefault('AIRPODS_DEVICE','AA:BB:CC:DD:EE:FF')
 import asyncio, unittest
 from unittest.mock import AsyncMock, patch
 from airpods_handoff import Adapter
@@ -53,14 +53,14 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_late_ack_after_remote_call_cannot_retake(self):
         a=self.setup_audio();p=a.policy;p.owner='remote';p.remote='idle';p.player(1,'new',True);p.streams.add('new');p.decide(1);p.decide(1.7);token=p.inflight_token
         async def cli(*args):
-            if args[-1] in ('take','take-media'):p.route(2,dict(connected=True,ready=True,owner='remote',remote_activity='active',source='remote',source_kind='call'),1)
+            if args[-1]=='take':p.route(2,dict(connected=True,ready=True,owner='remote',remote_activity='active',source='remote',source_kind='call'),1)
             return True,'multipoint ready\nowner linux\nremote-activity idle'
         a._cli=AsyncMock(side_effect=cli);a.evaluate=lambda _:None
         await a.command('take',token);self.assertEqual(p.owner,'remote');self.assertFalse(p.leased)
 
 
 class RemotePauseSequence(unittest.IsolatedAsyncioTestCase):
-    async def test_ownership_idle_then_remote_media_pauses_owned_player(self):
+    async def test_remote_media_does_not_pause_protected_local_player(self):
         a=Adapter(False);a.session=object();a.pw_ready=a.mpris_ready=True;a.pause_armed=True
         a.policy.generation=1;a.policy.owner='linux';a.policy.players={'cider':True};a.policy.streams={'cider'};a.identities={'cider':(10,'cider')}
         a.call=AsyncMock(return_value=[])
@@ -68,7 +68,7 @@ class RemotePauseSequence(unittest.IsolatedAsyncioTestCase):
         a.call.assert_not_awaited()
         a.observe_route(dict(connected=True,ready=True,owner='remote',remote_activity='active',source='remote',source_kind='media'),1)
         await asyncio.gather(*list(a.tasks))
-        self.assertEqual(a.call.await_count,1);self.assertEqual(a.call.await_args.args[4],'Pause')
+        a.call.assert_not_awaited()
         a.observe_route(dict(connected=True,ready=True,owner='remote',remote_activity='active',source='remote',source_kind='media'),1)
         self.assertFalse(a.tasks)
     async def test_remote_baseline_never_pauses_unowned_player(self):

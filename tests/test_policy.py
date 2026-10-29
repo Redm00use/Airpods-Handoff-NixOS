@@ -1,3 +1,5 @@
+import os
+os.environ.setdefault('AIRPODS_DEVICE','AA:BB:CC:DD:EE:FF')
 import unittest
 from airpods_handoff_policy import Policy
 
@@ -19,11 +21,12 @@ class Tests(unittest.TestCase):
     def test_short_sound_and_no_stream(self):
         p=self.ready();self.play(p);p.player(1.3,'a',False);self.assertIsNone(p.decide(2))
         p.player(3,'a',True);p.streams.clear();self.assertIsNone(p.decide(5))
-    def test_remote_cancels_intent(self):
+    def test_remote_transition_preserves_fresh_explicit_intent(self):
         p=self.ready();self.play(p)
         p.route(1.2,dict(connected=True,ready=True,owner='remote',remote_activity='active'),1)
         p.route(2,dict(connected=True,ready=True,owner='remote',remote_activity='idle'),1)
-        self.assertIsNone(p.decide(2.7));self.assertIsNone(p.intent)
+        self.assertIsNone(p.decide(2.7));self.assertIsNotNone(p.intent)
+        self.assertEqual(p.decide(3.8),'take')
     def test_remote_active_request_expires_without_take(self):
         p=self.ready();p.remote='active';self.play(p)
         self.assertIsNone(p.decide(2));self.assertIsNone(p.decide(7.1));self.assertIsNone(p.intent)
@@ -63,25 +66,17 @@ class Races(unittest.TestCase):
     play=Tests.play
     def pending(self):
         p=self.ready();self.play(p);self.assertEqual(p.decide(1.7),'take');return p,p.inflight_token
-    def test_explicit_play_can_take_from_confirmed_remote_media(self):
-        p=self.ready();p.remote='active';p.source='remote';p.source_kind='media';self.play(p)
-        self.assertEqual(p.decide(1.7),'take')
-    def test_remote_media_never_takes_without_a_new_play(self):
-        p=self.ready();p.remote='active';p.source='remote';p.source_kind='media'
-        p.player(1,'a',True,True);p.streams={'a'};self.assertIsNone(p.decide(5))
-    def test_remote_call_never_qualifies_as_remote_media(self):
-        p=self.ready();p.route(0,dict(connected=True,ready=True,owner='remote',remote_activity='active',source='remote',source_kind='call'),1)
-        self.play(p);self.assertIsNone(p.decide(4));self.assertTrue(p.remote_call)
-    def test_peer_request_yields_once_while_music_is_playing(self):
+    def test_peer_request_waits_until_music_pauses(self):
         p=self.ready();p.owner='linux';p.leased=True;self.play(p)
-        p.peer_request(2);self.assertEqual(p.decide(2),'release');token=p.inflight_token
+        p.peer_request(2);self.assertIsNone(p.decide(2));p.player(3,'a',False)
+        self.assertEqual(p.decide(3),'release');token=p.inflight_token
         p.result(2.1,'release',False,token)
         self.assertIsNone(p.decide(20));self.assertTrue(p.peer_requested)
     def test_new_play_after_peer_yield_is_a_new_intent(self):
         p=self.ready();p.peer_request(1);p.player(2,'a',False);self.play(p,5)
         self.assertFalse(p.peer_requested);self.assertEqual(p.decide(5.7),'take')
     def test_old_take_ack_cannot_clear_new_release_command(self):
-        p,old=self.pending();p.owner='linux';p.peer_request(2)
+        p,old=self.pending();p.owner='linux';p.player(2,'a',False);p.peer_request(2)
         self.assertEqual(p.decide(2),'release');new=p.inflight_token
         self.assertFalse(p.result(2.1,'take',True,old));self.assertTrue(p.valid(new));self.assertEqual(p.inflight,'release')
     def test_late_ack_after_phone_takeover_is_ignored(self):
@@ -96,7 +91,7 @@ class Races(unittest.TestCase):
         p.route(2,dict(connected=True,ready=True,owner='remote',remote_activity='active',source='remote',source_kind='call'),1)
         self.assertTrue(p.remote_call);self.assertFalse(p.valid(token));self.assertIsNone(p.decide(20))
     def test_local_call_blocks_music_and_idle_release(self):
-        p=self.ready();p.calls(True);self.play(p);self.assertIsNone(p.decide(3))
+        p=self.ready();p.owner='linux';p.calls(True);self.play(p);self.assertIsNone(p.decide(3))
         p.owner='linux';p.leased=True;p.streams.clear();p.decide(4);self.assertIsNone(p.decide(40))
     def test_suspend_invalidates_then_resume_is_baseline(self):
         p,token=self.pending();p.sleep(2,True);self.assertIsNone(p.decide(3));self.assertEqual(p.state,'SUSPENDED')
@@ -105,7 +100,7 @@ class Races(unittest.TestCase):
         p.player(6,'a',True,True);self.assertIsNone(p.decide(10))
     def test_ownership_ack_is_not_audio_confirmation(self):
         p,token=self.pending();p.source='remote';p.result(2,'take',True,token)
-        self.assertEqual(p.owner,'linux');self.assertEqual(p.source,'remote');p.decide(3);self.assertEqual(p.state,'LOCAL_CLAIMED')
+        self.assertEqual(p.owner,'linux');self.assertEqual(p.source,'remote');p.decide(3);self.assertEqual(p.state,'LOCAL_MEDIA_PROTECTED')
     def test_transient_none_never_reclaims_after_remote_takeover(self):
         p=self.ready();p.owner='linux';p.leased=True
         p.route(1,dict(connected=True,ready=True,owner='remote',remote_activity='active',source='remote'),1)

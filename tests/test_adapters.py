@@ -1,5 +1,5 @@
 import os
-os.environ['AIRPODS_DEVICE']='AA:BB:CC:DD:EE:FF'
+os.environ.setdefault('AIRPODS_DEVICE','AA:BB:CC:DD:EE:FF')
 import unittest
 from airpods_handoff import Adapter
 

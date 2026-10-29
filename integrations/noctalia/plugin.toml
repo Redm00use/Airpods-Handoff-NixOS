@@ -1,0 +1,13 @@
+id = "local/airpods_handoff"
+name = "AirPods Handoff"
+version = "0.3.0"
+plugin_api = 24
+author = "local"
+description = "Audio ownership, manual Linux priority and conflict recovery"
+
+[[panel]]
+id = "status"
+entry = "panel.luau"
+width = 460
+height = 310
+position = "top_right"

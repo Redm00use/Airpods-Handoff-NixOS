@@ -8,7 +8,9 @@
 | Сценарий | Действия | Что проверить |
 |---|---|---|
 | iPhone → Linux | Музыка iPhone → pause → Play Cider/YouTube | Один take; source=linux; транспорт active; звук слышен; play_to_ack_ms |
-| Linux → iPhone | Play Linux → Play iPhone | Remote request/AudioSource; один yield; релевантный локальный плеер на паузе; no auto-resume |
+| Linux → iPhone после паузы | Поставить Linux на паузу → Play iPhone | Приоритет снимается, не более одного release, телефон слышен |
+| Linux защищён | Linux играет → запустить iPhone | Локального release/Pause нет; при автономном захвате один bounded restore, повторный конфликт без цикла |
+| Звонок ПК | Discord/Telegram call → звук/уведомление iPhone | Capture+playback/Communication защищены при mute/тишине, после hangup защита снимается |
 | Пауза/возобновление | Play → Pause 1 с → Play; затем Pause >4 с | Короткая пауза не отдаёт ownership; длинная — не более одного release |
 | Уведомления | iPhone играет, вызвать уведомление Linux | Нет take от Notification/Event, источник не меняется из-за решения нашего FSM |
 | Одновременно | iPhone играет, Play Linux | Новый локальный Play использует guarded take-media для подтверждённой музыки; звонок/неизвестный тип блокируют захват |
@@ -19,7 +21,9 @@
 | Длительное медиа | Linux играет >60 с | Нет прежнего ложного release через 30 с |
 
 `play_to_ack_ms` — задержка до подтверждения ownership, НЕ до слышимого звука.
-`audio-active` означает наблюдение AudioSource Linux + MediaTransport active + PW node running, НЕ измерение акустического выхода.
+`audio-active` означает наблюдение AudioSource Linux + MediaTransport active + PW node running и отсутствие зависших финальных output links, НЕ измерение акустического выхода.
 Слуховую проверку отмечать отдельно. Для 10 повторов сохранять median/p95, число неуспешных переходов и ошибки транспорта.
 
 Если телефон продолжает играть, программа не использует --force: оно может перебить звонок при неизвестном состоянии протокола. Для подтверждённой музыки используется take-media с повторной проверкой в контроллере; звонок и неизвестность блокируют захват.
+
+При Cider Playing и source=linux отдельно проверять состояния финальных EasyEffects→A2DP links: `init`/`paused` считаются зависанием при running upstream. Автоматический ремонт должен привести их в active; повтор того же serial не ремонтируется бесконечно.

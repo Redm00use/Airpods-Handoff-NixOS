@@ -35,6 +35,16 @@
         in {
           unit = self.packages.${system}.default;
           protocol = self.packages.${system}.airpodsctl;
+          cli = pkgs.runCommand "airpods-handoff-cli-check" {} ''
+            ${self.packages.${system}.default}/bin/airpods-handoff --help > /dev/null
+            ${self.packages.${system}.default}/bin/airpods-handoffctl --help > /dev/null
+            if AIRPODS_DEVICE=invalid ${self.packages.${system}.default}/bin/airpods-handoff > /dev/null 2>&1; then
+              exit 1
+            fi
+            test -f ${self.packages.${system}.default}/share/airpods-handoff/noctalia/plugin.toml
+            test -f ${self.packages.${system}.default}/share/airpods-handoff/noctalia/panel.luau
+            touch "$out"
+          '';
           module = pkgs.runCommand "airpods-handoff-module-check" { nativeBuildInputs = [ pkgs.python3 ]; } ''
             python3 - <<'PY'
             import json
@@ -51,7 +61,7 @@
         });
       devShells = eachSystem (system: let pkgs = import nixpkgs { inherit system; }; app = packageFor system; in {
         default = pkgs.mkShell {
-          packages = [ app.python pkgs.zig_0_16 pkgs.pkg-config pkgs.bluez pkgs.systemd ];
+          packages = [ app.python pkgs.zig_0_16 pkgs.pkg-config pkgs.bluez pkgs.systemd pkgs.luau ];
           shellHook = ''export PYTHONPATH="$PWD/src''${PYTHONPATH:+:$PYTHONPATH}"'';
         };
       });

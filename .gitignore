@@ -1,0 +1,12 @@
+result
+result-*
+.direnv/
+.envrc.local
+__pycache__/
+*.py[cod]
+.zig-cache/
+zig-out/
+*.log
+*.plist
+*.csv
+.env
