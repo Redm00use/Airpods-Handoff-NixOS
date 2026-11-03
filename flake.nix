@@ -10,7 +10,7 @@
         inherit system;
         modules = [ ./nix/module.nix {
           system.stateVersion = "26.05";
-          services.airpodsHandoff = { enable = true; user = "alice"; device = "AA:BB:CC:DD:EE:FF"; spoofAppleDeviceId = true; };
+          services.airpodsHandoff = { enable = true; user = "alice"; device = "AA:BB:CC:DD:EE:FF"; macLikeIdentity.enable = true; macLikeIdentity.name = "My Mac"; };
         } ];
       }).config;
     in {
@@ -31,6 +31,8 @@
             controller = cfg.systemd.user.services.airpodsctl.serviceConfig.ExecStart;
             handoff = cfg.systemd.user.services.airpods-auto-switch.serviceConfig.ExecStart;
             deviceId = cfg.hardware.bluetooth.settings.General.DeviceID;
+            bluetoothName = cfg.hardware.bluetooth.settings.General.Name;
+            bluetoothClass = cfg.hardware.bluetooth.settings.General.Class;
           });
         in {
           unit = self.packages.${system}.default;
@@ -55,6 +57,8 @@
             assert 'serve --auto-switch=external' in d['controller']
             assert d['handoff'].endswith('/bin/airpods-handoff')
             assert d['deviceId']=='bluetooth:004C:0000:0000'
+            assert d['bluetoothName']=='My Mac'
+            assert d['bluetoothClass']=='0x00010c'
             PY
             touch "$out"
           '';
@@ -67,3 +71,4 @@
       });
     };
 }
+

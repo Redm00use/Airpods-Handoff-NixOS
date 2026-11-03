@@ -2,6 +2,7 @@ local state = {available=false,title="AirPods Handoff",detail="Подключа�
 local streaming = false
 local busy = false
 local actionError = nil
+local modes = {call="Разговор",music="Музыка",video="Видео",game="Игра",mixed="Несколько медиапотоков",media="Медиа",idle="Нет активного звука"}
 
 local function decode(raw)
   local ok,value=pcall(noctalia.json.decode,raw or "{}")
@@ -13,6 +14,7 @@ local function render()
   panel.render(ui.scroll({gap=12,padding=12},{
     ui.row({gap=10,align="center"},{ui.glyph({name="device-airpods",size=25}),ui.label({text="AirPods Handoff",fontSize=20,fontWeight="bold"})}),
     ui.label({text=state.title or "Состояние недоступно",fontSize=16,fontWeight="bold",maxLines=2}),
+    ui.label({text="Режим ПК: "..(modes[state.local_mode] or "Уточняется"),fontSize=13,color="secondaryText"}),
     ui.label({text=actionError or state.detail or "",fontSize=13,color="secondaryText",maxLines=3}),
     ui.row({gap=8},{
       ui.button({text="Авто",selected=state.available and not state.pinned,enabled=state.available and not busy,onClick=function() control("auto") end}),
@@ -45,3 +47,4 @@ function control(action)
 end
 function onOpen() render();subscribe() end
 function update() noctalia.setUpdateInterval(5000);subscribe() end
+

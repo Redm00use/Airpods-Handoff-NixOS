@@ -18,10 +18,11 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_resume_connected_but_unsynced_still_requests_snapshot(self):
         from dbus_next import Variant
         a=self.setup_audio();a.system=object();a.policy.ready=False;a.policy.generation=None
-        a.call=AsyncMock(return_value=[Variant('b',True)])
+        a.call=AsyncMock(return_value=[{'/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF':{'org.bluez.Device1':{'Connected':Variant('b',True)}}}])
         async def snapshot():a.policy.ready=True;a.policy.generation=2
         a.snapshot=AsyncMock(side_effect=snapshot)
         await a.recover();a.snapshot.assert_awaited_once()
+        self.assertEqual(a.call.await_args.args[4],'GetManagedObjects')
     async def test_shadow_never_changes_audio(self):
         a=self.setup_audio();a.shadow=True
         await a.ensure_audio(a.policy.context(),0);a.pulse.assert_not_awaited()
@@ -75,3 +76,4 @@ class RemotePauseSequence(unittest.IsolatedAsyncioTestCase):
         a=Adapter(False);a.pw_ready=a.mpris_ready=True;a.call=AsyncMock()
         a.observe_route(dict(connected=True,ready=True,owner='remote',remote_activity='active',source='remote',source_kind='media'),1)
         a.call.assert_not_awaited();self.assertFalse(a.tasks)
+

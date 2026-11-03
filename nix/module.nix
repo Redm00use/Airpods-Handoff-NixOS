@@ -9,13 +9,23 @@ in {
     device = mkOption { type = types.strMatching "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"; description = "Already paired AirPods Bluetooth address."; example = "AA:BB:CC:DD:EE:FF"; };
     package = mkOption { type = types.package; default = pkgs.callPackage ./package.nix {}; description = "Handoff package, including its matching AACP controller."; };
     spoofAppleDeviceId = mkOption { type = types.bool; default = false; description = "Advertise an Apple Bluetooth DeviceID to enable experimental multipoint. Applies to the adapter, not just this pair."; };
+    macLikeIdentity = {
+      enable = mkEnableOption "Mac-like Bluetooth identity (Apple DeviceID, laptop class and adapter name; no Apple Account enrollment)";
+      name = mkOption { type = types.strMatching "[^\n\r]+"; default = "Mac"; description = "Default Bluetooth adapter name. An existing BlueZ Alias may override this name."; };
+    };
     shadow = mkOption { type = types.bool; default = false; description = "Observe and log decisions without ownership, pause or audio commands."; };
   };
   config = mkIf cfg.enable {
     hardware.bluetooth.enable = mkDefault true;
-    hardware.bluetooth.settings = mkIf cfg.spoofAppleDeviceId {
-      General.DeviceID = mkDefault "bluetooth:004C:0000:0000";
-    };
+    hardware.bluetooth.settings.General = lib.mkMerge [
+      (mkIf (cfg.spoofAppleDeviceId || cfg.macLikeIdentity.enable) {
+        DeviceID = mkDefault "bluetooth:004C:0000:0000";
+      })
+      (mkIf cfg.macLikeIdentity.enable {
+        Name = mkDefault cfg.macLikeIdentity.name;
+        Class = mkDefault "0x00010c";
+      })
+    ];
     services.pipewire = {
       enable = mkDefault true;
       pulse.enable = mkDefault true;
@@ -56,3 +66,4 @@ in {
     };
   };
 }
+

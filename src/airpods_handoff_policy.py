@@ -17,8 +17,10 @@ class Policy:
     local_focus: bool = False
     restore_attempted: bool = False
     restore_at: float | None = None
+    restore_rearm_at: float | None = None
     local_call: bool = False
     remote_call: bool = False
+    interrupted_call: bool = False
     peer_requested: bool = False
     peer_release_attempted: bool = False
     players: dict = field(default_factory=dict)
@@ -43,6 +45,11 @@ class Policy:
         self.inflight = self.inflight_token = None
         if clear_lease: self.leased = False
 
+    def rearm_restore(self, now):
+        if self.restore_rearm_at is not None and now>=self.restore_rearm_at:
+            self.restore_attempted=False
+            self.restore_rearm_at=None
+
     def context(self):
         return self.generation, self.revision
 
@@ -61,7 +68,9 @@ class Policy:
     def sleep(self, now, sleeping):
         self.invalidate()
         self.local_focus = self.restore_attempted = False
+        self.interrupted_call = False
         self.restore_at = None
+        self.restore_rearm_at = None
         self.suspended = sleeping
         self.ready = False
         self.source = self.source_kind = 'unknown'
@@ -77,6 +86,7 @@ class Policy:
                 self.peer_requested = self.peer_release_attempted = False
         self.local_call = active
         if not active:
+            self.interrupted_call = False
             if self.intent and self.intent[0]=='@call':self.intent=self.stable_at=None
             if self.inflight in ('take','claim','restore') and not self.protected() and not self.inflight_manual:self.invalidate(clear_lease=False)
 
@@ -109,10 +119,15 @@ class Policy:
         self.cooldown = now + 2.5
 
     def route(self, now, event, generation):
+        # A separate interruption after sustained local ownership gets a new
+        # bounded attempt; repeated contention never re-arms itself.
+        if self.healthy and not self.suspended:self.rearm_restore(now)
         if self.generation != generation:
             self.invalidate()
             self.local_focus = self.restore_attempted = False
+            self.interrupted_call = False
             self.restore_at = None
+            self.restore_rearm_at = None
             self.generation = generation
             self.peer_requested = self.peer_release_attempted = False
         old, old_remote, old_call = self.owner, self.remote, self.remote_call
@@ -121,6 +136,7 @@ class Policy:
         self.connected = event.get('connected', False)
         if not self.connected:
             self.local_focus = self.restore_attempted = False
+            self.interrupted_call = False
             self.restore_at = None
         self.ready = event.get('ready', False)
         self.owner = event.get('owner', 'unknown')
@@ -128,6 +144,9 @@ class Policy:
         self.source = event.get('source', 'unknown')
         self.source_kind = event.get('source_kind', 'unknown')
         self.remote_call = self.source != 'linux' and self.source_kind == 'call'
+        if not self.connected or self.owner!='linux' or self.source!='linux':self.restore_rearm_at=None
+        if self.remote_call and self.local_focus and self.local_call:
+            self.interrupted_call = True
         expected_release = (self.inflight == 'release' and self.owner == 'remote'
                             and self.remote == 'idle' and not self.protected())
         if (not self.connected or (self.remote == 'active' and old_remote != 'active')
@@ -138,6 +157,16 @@ class Policy:
                 self.intent = pending_intent
                 self.play_started = pending_started
                 self.manual_pending = pending_intent[0]=='@manual'
+        # Resume only a call that previously owned the local audio channel.
+        # Unknown/transient source reports and startup calls grant no permission.
+        if (self.interrupted_call and self.connected and self.ready and not self.suspended
+                and self.local_call and self.local_focus and not self.remote_call
+                and self.remote=='idle' and self.source_kind=='idle'):
+            self.interrupted_call = False
+            self.invalidate(clear_lease=False)
+            self.restore_attempted = False
+            self.intent = ('@call', now+6)
+            self.play_started = now
 
     def player(self, now, key, playing, baseline=False):
         old = self.players.get(key, False)
@@ -161,13 +190,19 @@ class Policy:
             self.manual_pending=False
         if self.suspended: self.state = 'SUSPENDED'; return None
         if not self.connected: self.state = 'DISCONNECTED'; return None
-        if not self.healthy or not self.ready: self.state = 'DEGRADED'; return None
+        if not self.healthy or not self.ready:
+            self.restore_rearm_at=None
+            self.state = 'DEGRADED'; return None
+        if self.remote_call: self.state = 'REMOTE_CALL'; return None
         if not self.protected():
             self.local_focus = self.restore_attempted = False
             self.restore_at = None
+            self.restore_rearm_at = None
         elif self.owner == 'linux' and self.source == 'linux':
             self.local_focus = True
             self.restore_at = None
+            if self.restore_attempted and self.restore_rearm_at is None:self.restore_rearm_at=now+30
+            self.rearm_restore(now)
         if self.local_focus and self.protected() and self.source == 'remote' and self.source_kind == 'media' and not self.remote_call:
             if self.inflight:return None
             if self.restore_attempted:
@@ -237,8 +272,10 @@ class Policy:
     def deadline(self, now):
         due = []
         if self.restore_at is not None:due.append(self.restore_at)
+        if self.restore_rearm_at is not None:due.append(self.restore_rearm_at)
         if self.intent:
             due.append(self.intent[1])
             if self.stable_at is not None: due.append(max(self.stable_at + .65, self.cooldown))
         if self.idle_at is not None and self.leased: due.append(max(self.idle_at + 4, self.cooldown))
         return min((x for x in due if x > now), default=None)
+
