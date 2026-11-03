@@ -1,5 +1,25 @@
 # AirPods Handoff for NixOS
 
+## 0.4.0 reliability update
+
+- A continuing PC call can make one guarded return after an interrupting iPhone
+  call reports idle. Baseline calls, hangup, sleep, disconnect and unknown remote
+  states do not authorize that return.
+- Status/panel report call, music, video, game, mixed, media or idle from observed
+  stream roles and identities. Untagged browser content remains generic media.
+- MPRIS replies are fenced against newer playback/owner events; suspend/resume
+  suppresses decisions until fresh baselines are ready. Recovery discovers the
+  configured device across BlueZ adapters instead of assuming hci0.
+- Helper processes are reaped on cancellation/timeout; late sink errors trigger
+  bounded audio recovery. Microphone selection and A2DP/HFP remain WirePlumber's
+  responsibility.
+- Optional `services.airpodsHandoff.macLikeIdentity.enable = true` advertises
+  Apple DeviceID, laptop class and a configurable default name (`name = "Mac"`).
+  This is Bluetooth identification, **not Apple Account enrollment**, and cannot
+  guarantee that iPhone treats Linux as an authenticated Mac. Saved adapter Alias
+  can override the default Name.
+
+
 Experimental event-driven audio ownership handoff for AirPods Pro 2 USB-C, iPhone and Linux. [Detailed installation and status matrix (Russian)](README.md).
 
 This reuses a locally extended MIT-licensed `hacel/airpodsctl` controller. A Python FSM consumes BlueZ D-Bus, MPRIS, PipeWire and authenticated AACP routing events. It does not loop Bluetooth disconnect/connect, modify pairing keys, or implement Apple-account/iCloud Automatic Switching.
@@ -72,3 +92,4 @@ Hardware update: Cider-over-iPhone and a Discord call recovery were hearing-conf
 The optional [Noctalia 5.2 / Luau API 24 panel](integrations/noctalia/README.md) displays source/call/recovery/conflict and exposes the same controls. It does not depend on personal scripts or addresses. Status strings are currently Russian.
 
 Recovery now reacts immediately to a known sink error and repairs late-arriving graph edges within the same attempt. The extra 300ms restore delay was removed only for a proven local session and typed remote media. An initial optimized sample showed 264ms from ownership ACK to observed graph readiness; the user initially perceived little difference. The latest policy change is not an acoustic latency guarantee.
+

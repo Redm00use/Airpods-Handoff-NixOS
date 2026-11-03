@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 — 2026-11-03
+
+- Resume a previously local, continuing call once after confirmed iPhone call end;
+  cancel on hangup, suspend, disconnect, or a new remote call.
+- Expose evidence-based local session modes and call applications in status/panel.
+- Add opt-in Mac-like Bluetooth identity without claiming Apple Account integration.
+- Fence stale MPRIS replies and suspend/resume baselines, latch fatal health failures,
+  and find the configured AirPods on any BlueZ adapter.
+- Reap cancelled helpers, close service sockets/tasks, validate routing and graph
+  input, and recover late sink errors independently of ownership command completion.
+- Honor XDG_CONFIG_HOME and show shadow mode explicitly.
+- Add lifecycle regression coverage and Python 3.11/3.13 CI alongside Nix checks.
+
 ## 0.3.0 — 2026-10-29
 
 - Persistent manual pin/auto mode and one explicit return attempt after contention.
@@ -19,3 +32,4 @@
 - Fresh graph baselines after sleep; bounded refresh of invalidated MPRIS state.
 - Expected release-event/ACK ordering regression and expanded Python tests (95).
 - Hardware verification remains incomplete; do not claim complete Apple Automatic Switching.
+

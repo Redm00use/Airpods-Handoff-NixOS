@@ -1,4 +1,21 @@
-# Verification — 2026-10-29, 0.3.0
+# Verification
+
+## 2026-11-03, 0.4.0
+
+- New regressions cover interrupted-call return/cancellation, stale MPRIS replies,
+  owner removal, resume barriers, late snapshots, fatal health, multi-adapter
+  discovery, cancelled helpers, invalid inputs, late sink errors and shutdown.
+- The editing environment can run pure/async tests but denies AF_UNIX socket
+  creation. Socket integration tests are retained unchanged and run in GitHub
+  Actions; they are not replaced by mocks or silently skipped in CI.
+- Python 3.11/3.13 CI runs the complete suite. Nix checks build the controller,
+  run its protocol tests, compile the panel, and validate packaged CLI/module
+  contracts including optional Bluetooth Name/Class/DeviceID.
+- No new AirPods/iPhone acoustic test, physical suspend/resume test or Apple
+  Account enrollment has been performed. Mac-like identity changes Bluetooth
+  metadata only; it does not prove Apple relay participation.
+
+## Historical evidence — 2026-10-29, 0.3.0
 
 ## Automated checks
 
@@ -23,3 +40,4 @@ Test setup: one AirPods Pro 2 USB-C pair, iPhone and NixOS x86_64-linux. This is
 - Telegram-specific hardware calls, physical sleep/resume, long repeated acoustic tests, ARM and other adapters/models/firmware remain unverified.
 
 See [manual tests](manual-tests.ru.md). `owner=linux`, an ownership ACK, or a running transport alone does not prove audible sound. The implementation also checks observed source and final PipeWire graph state; hearing verification is still separate.
+

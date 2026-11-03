@@ -7,7 +7,9 @@ def status_for(adapter):
     _,node=adapter.bluez_node()
     audio=bool(p.source=='linux' and adapter.transport=='active' and node and node.get('state')=='running' and not adapter.stalled_output_links())
     conflict=p.state=='LOCAL_CONTESTED'
-    if not p.connected:title,detail='AirPods не подключены','Подключите наушники к ПК вручную.'
+    if p.suspended:title,detail='ПК в режиме сна','Автоматическое переключение приостановлено.'
+    elif adapter.shadow:title,detail='Режим наблюдения','Решения записываются в журнал; переключение и восстановление звука отключены.'
+    elif not p.connected:title,detail='AirPods не подключены','Подключите наушники к ПК вручную.'
     elif not p.ready or not p.healthy:title,detail='Состояние уточняется','Жду актуальные данные наушников и аудиосистемы.'
     elif p.remote_call:title,detail='Звонок на iPhone','Возврат на ПК доступен после завершения звонка.'
     elif conflict:title,detail='Конфликт переключения','Автовозврат остановлен. Нажмите «Вернуть на ПК» для одной новой попытки.'
@@ -22,18 +24,20 @@ def status_for(adapter):
     if p.pinned and p.source=='remote' and not conflict and not p.remote_call and not p.inflight:
         detail='Закрепление включено, но канал у iPhone. Нажмите «Вернуть на ПК».'
     if adapter.last_command_error:detail=adapter.last_command_error
-    return dict(version=1,available=True,state=p.state,title=title,detail=detail,pinned=p.pinned,
+    return dict(version=1,available=True,shadow=adapter.shadow,state=p.state,title=title,detail=detail,pinned=p.pinned,
                 conflict=conflict,connected=p.connected,ready=p.ready,owner=p.owner,source=p.source,
                 audio_active=audio,local_call=p.local_call,remote_call=p.remote_call,
-                can_return=bool(p.connected and p.ready and p.healthy and not p.suspended and not p.remote_call
+                local_mode=adapter.local_mode(),media_modes=sorted(adapter.media_modes),
+                call_apps=list(adapter.call_tracker.evidence),
+                can_return=bool(not adapter.shadow and p.connected and p.ready and p.healthy and not p.suspended and not p.remote_call
                                 and (p.remote=='idle' or p.source_kind=='media')),pending=bool(p.inflight))
 
 class ControlServer:
     def __init__(self,adapter,runtime=None,preferences=None):
         self.adapter=adapter
         self.path=Path(runtime or os.environ['XDG_RUNTIME_DIR'])/'airpods-handoff.control'
-        self.preferences=Path(preferences or Path.home()/'.config/airpods-handoff/preferences.json')
-        self.watchers=set();self.last_payload=None;self.server=None
+        self.preferences=Path(preferences) if preferences is not None else Path(os.environ.get('XDG_CONFIG_HOME') or Path.home()/'.config')/'airpods-handoff/preferences.json'
+        self.watchers=set();self.connections=set();self.last_payload=None;self.server=None
     async def start(self):
         try:
             if self.preferences.stat().st_size<=1024:
@@ -45,6 +49,12 @@ class ControlServer:
         self.path.chmod(0o600)
         self.publish()
     def snapshot(self):return status_for(self.adapter)
+    async def close(self):
+        if self.server:
+            self.server.close();await self.server.wait_closed()
+            for writer in tuple(self.connections):writer.close()
+            await asyncio.gather(*(writer.wait_closed() for writer in tuple(self.connections)),return_exceptions=True)
+            self.path.unlink(missing_ok=True)
     def publish(self):
         payload=json.dumps(self.snapshot(),ensure_ascii=False,separators=(',',':')).encode()+b'\n'
         if payload==self.last_payload:return
@@ -75,6 +85,7 @@ class ControlServer:
             self.adapter.spawn(self.adapter.ensure_audio(p.context(),now))
         return self.snapshot()
     async def handle(self,reader,writer):
+        self.connections.add(writer)
         try:
             peer=writer.get_extra_info('socket').getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12)
             if struct.unpack('3i',peer)[1]!=os.getuid():return
@@ -94,6 +105,8 @@ class ControlServer:
                 try:await writer.drain()
                 except (OSError,ConnectionError):pass
         finally:
+            self.connections.discard(writer)
             self.watchers.discard(writer);writer.close()
             try:await writer.wait_closed()
             except (OSError,ConnectionError):pass
+

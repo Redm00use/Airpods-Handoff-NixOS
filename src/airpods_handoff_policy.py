@@ -19,6 +19,7 @@ class Policy:
     restore_at: float | None = None
     local_call: bool = False
     remote_call: bool = False
+    interrupted_call: bool = False
     peer_requested: bool = False
     peer_release_attempted: bool = False
     players: dict = field(default_factory=dict)
@@ -61,6 +62,7 @@ class Policy:
     def sleep(self, now, sleeping):
         self.invalidate()
         self.local_focus = self.restore_attempted = False
+        self.interrupted_call = False
         self.restore_at = None
         self.suspended = sleeping
         self.ready = False
@@ -77,6 +79,7 @@ class Policy:
                 self.peer_requested = self.peer_release_attempted = False
         self.local_call = active
         if not active:
+            self.interrupted_call = False
             if self.intent and self.intent[0]=='@call':self.intent=self.stable_at=None
             if self.inflight in ('take','claim','restore') and not self.protected() and not self.inflight_manual:self.invalidate(clear_lease=False)
 
@@ -112,6 +115,7 @@ class Policy:
         if self.generation != generation:
             self.invalidate()
             self.local_focus = self.restore_attempted = False
+            self.interrupted_call = False
             self.restore_at = None
             self.generation = generation
             self.peer_requested = self.peer_release_attempted = False
@@ -121,6 +125,7 @@ class Policy:
         self.connected = event.get('connected', False)
         if not self.connected:
             self.local_focus = self.restore_attempted = False
+            self.interrupted_call = False
             self.restore_at = None
         self.ready = event.get('ready', False)
         self.owner = event.get('owner', 'unknown')
@@ -128,6 +133,8 @@ class Policy:
         self.source = event.get('source', 'unknown')
         self.source_kind = event.get('source_kind', 'unknown')
         self.remote_call = self.source != 'linux' and self.source_kind == 'call'
+        if self.remote_call and self.local_focus and self.local_call:
+            self.interrupted_call = True
         expected_release = (self.inflight == 'release' and self.owner == 'remote'
                             and self.remote == 'idle' and not self.protected())
         if (not self.connected or (self.remote == 'active' and old_remote != 'active')
@@ -138,6 +145,16 @@ class Policy:
                 self.intent = pending_intent
                 self.play_started = pending_started
                 self.manual_pending = pending_intent[0]=='@manual'
+        # Resume only a call that previously owned the local audio channel.
+        # Unknown/transient source reports and startup calls grant no permission.
+        if (self.interrupted_call and self.connected and self.ready and not self.suspended
+                and self.local_call and self.local_focus and not self.remote_call
+                and self.remote=='idle' and self.source_kind=='idle'):
+            self.interrupted_call = False
+            self.invalidate(clear_lease=False)
+            self.restore_attempted = False
+            self.intent = ('@call', now+6)
+            self.play_started = now
 
     def player(self, now, key, playing, baseline=False):
         old = self.players.get(key, False)
@@ -162,6 +179,7 @@ class Policy:
         if self.suspended: self.state = 'SUSPENDED'; return None
         if not self.connected: self.state = 'DISCONNECTED'; return None
         if not self.healthy or not self.ready: self.state = 'DEGRADED'; return None
+        if self.remote_call: self.state = 'REMOTE_CALL'; return None
         if not self.protected():
             self.local_focus = self.restore_attempted = False
             self.restore_at = None
@@ -242,3 +260,4 @@ class Policy:
             if self.stable_at is not None: due.append(max(self.stable_at + .65, self.cooldown))
         if self.idle_at is not None and self.leased: due.append(max(self.idle_at + 4, self.cooldown))
         return min((x for x in due if x > now), default=None)
+

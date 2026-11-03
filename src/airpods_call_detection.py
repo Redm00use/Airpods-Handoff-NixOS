@@ -16,7 +16,9 @@ def call_sessions(objects):
         cls=p.get('media.class','')
         if cls not in ('Stream/Input/Audio','Stream/Output/Audio'):continue
         if info.get('state') not in ('running','idle','error'):continue
-        merged=dict(clients.get(p.get('client.id'),{}));merged.update(p)
+        client_id=p.get('client.id')
+        if isinstance(client_id,str) and client_id.isdecimal():client_id=int(client_id)
+        merged=dict(clients.get(client_id,{}));merged.update(p)
         role=str(merged.get('media.role','')).lower();name=str(merged.get('node.name','')).lower()
         app=app_family(merged)
         # Spectrum, monitor and notification streams never establish a call lease.
@@ -64,3 +66,4 @@ class CallTracker:
         if not self.active and self.onset is not None:values.append(self.onset+.2)
         if self.expiry is not None:values.append(self.expiry)
         return min((x for x in values if x>now),default=None)
+
