@@ -179,11 +179,17 @@ class Adapter:
                 log.warning('output-link repair budget exhausted; no further mutations');return
             self.relinked.add(identity)
             # Re-create only a proven stalled edge into this A2DP sink, leaving mic/effect chain intact.
-            removed=await self.link_command('-d',output,input_)
-            if not removed:continue
-            # Undo the temporary disconnection even if ownership changes during the command.
-            restored=await self.link_command(output,input_)
-            if not restored:restored=await self.link_command(output,input_)
+            try:
+                removed=await self.link_command('-d',output,input_)
+                if not removed:continue
+                # Undo the temporary disconnection even if ownership changes during the command.
+                restored=await self.link_command(output,input_)
+                if not restored:restored=await self.link_command(output,input_)
+            except asyncio.CancelledError:
+                # Cancellation can lose the delete ACK after PipeWire applied it.
+                # Restore our edge before shutting down the helper/session.
+                await self.link_command(output,input_)
+                raise
             repaired+=int(restored)
             log.log(logging.INFO if restored else logging.ERROR,'stalled A2DP output-link repaired=%s edge=%s; one attempt per link generation',restored,identity)
         return repaired

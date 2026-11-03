@@ -67,6 +67,30 @@ class CallReturn(unittest.TestCase):
         self.assertFalse(p.result(5,'take',True,token))
         self.assertEqual(p.owner,'remote')
 
+    def test_restore_rearms_only_after_thirty_seconds_of_local_ownership(self):
+        p=self.local();p.route(1,route(),1)
+        self.assertEqual(p.decide(1),'restore')
+        p.result(1.1,'restore',True,p.inflight_token)
+        p.route(2,route('media','linux','idle','linux'),1);p.decide(2)
+        self.assertEqual(p.deadline(2),32)
+        p.decide(32)
+        p.route(40,route(),1)
+        self.assertEqual(p.decide(40),'restore')
+        p.result(40.1,'restore',True,p.inflight_token)
+        p.route(41,route(),1)
+        for t in (41,100,1000):
+            self.assertIsNone(p.decide(t))
+            self.assertEqual(p.state,'LOCAL_CONTESTED')
+
+    def test_brief_local_return_does_not_reset_contention_budget(self):
+        p=self.local();p.route(1,route(),1);p.decide(1)
+        p.result(1.1,'restore',True,p.inflight_token)
+        p.route(2,route('media','linux','idle','linux'),1);p.decide(2)
+        p.route(3,route(),1)
+        self.assertIsNone(p.restore_rearm_at)
+        self.assertIsNone(p.decide(100))
+        self.assertEqual(p.state,'LOCAL_CONTESTED')
+
 
 class AdapterRaces(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -191,6 +215,14 @@ class AdapterRaces(unittest.IsolatedAsyncioTestCase):
             'org.freedesktop.DBus.Properties','PropertiesChanged','sa{sv}as',
             ['org.bluez.Device1',{'Connected':Variant('b',True)},[]]))
         self.assertEqual(a.policy.generation,(42,2))
+
+    async def test_cancelled_link_delete_restores_possible_removed_edge(self):
+        a=self.a;a.policy=Policy(connected=True,ready=True,healthy=True,
+            owner='linux',source='linux',local_call=True,generation=1)
+        a.stalled_output_links=lambda:[((10,100),20,21)]
+        a.link_command=AsyncMock(side_effect=[asyncio.CancelledError(),True])
+        with self.assertRaises(asyncio.CancelledError):await a.repair_output_links(a.policy.context())
+        self.assertEqual([call.args for call in a.link_command.await_args_list],[('-d',20,21),(20,21)])
 
 
 class Classifications(unittest.TestCase):

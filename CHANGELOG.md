@@ -4,6 +4,8 @@
 
 - Resume a previously local, continuing call once after confirmed iPhone call end;
   cancel on hangup, suspend, disconnect, or a new remote call.
+- Re-arm the single restore budget after 30 seconds of sustained local ownership,
+  so an unrelated later interruption does not remain blocked for the entire call.
 - Expose evidence-based local session modes and call applications in status/panel.
 - Add opt-in Mac-like Bluetooth identity without claiming Apple Account integration.
 - Fence stale MPRIS replies and suspend/resume baselines, latch fatal health failures,

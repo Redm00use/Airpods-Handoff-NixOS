@@ -17,6 +17,7 @@ class Policy:
     local_focus: bool = False
     restore_attempted: bool = False
     restore_at: float | None = None
+    restore_rearm_at: float | None = None
     local_call: bool = False
     remote_call: bool = False
     interrupted_call: bool = False
@@ -44,6 +45,11 @@ class Policy:
         self.inflight = self.inflight_token = None
         if clear_lease: self.leased = False
 
+    def rearm_restore(self, now):
+        if self.restore_rearm_at is not None and now>=self.restore_rearm_at:
+            self.restore_attempted=False
+            self.restore_rearm_at=None
+
     def context(self):
         return self.generation, self.revision
 
@@ -64,6 +70,7 @@ class Policy:
         self.local_focus = self.restore_attempted = False
         self.interrupted_call = False
         self.restore_at = None
+        self.restore_rearm_at = None
         self.suspended = sleeping
         self.ready = False
         self.source = self.source_kind = 'unknown'
@@ -112,11 +119,15 @@ class Policy:
         self.cooldown = now + 2.5
 
     def route(self, now, event, generation):
+        # A separate interruption after sustained local ownership gets a new
+        # bounded attempt; repeated contention never re-arms itself.
+        if self.healthy and not self.suspended:self.rearm_restore(now)
         if self.generation != generation:
             self.invalidate()
             self.local_focus = self.restore_attempted = False
             self.interrupted_call = False
             self.restore_at = None
+            self.restore_rearm_at = None
             self.generation = generation
             self.peer_requested = self.peer_release_attempted = False
         old, old_remote, old_call = self.owner, self.remote, self.remote_call
@@ -133,6 +144,7 @@ class Policy:
         self.source = event.get('source', 'unknown')
         self.source_kind = event.get('source_kind', 'unknown')
         self.remote_call = self.source != 'linux' and self.source_kind == 'call'
+        if not self.connected or self.owner!='linux' or self.source!='linux':self.restore_rearm_at=None
         if self.remote_call and self.local_focus and self.local_call:
             self.interrupted_call = True
         expected_release = (self.inflight == 'release' and self.owner == 'remote'
@@ -178,14 +190,19 @@ class Policy:
             self.manual_pending=False
         if self.suspended: self.state = 'SUSPENDED'; return None
         if not self.connected: self.state = 'DISCONNECTED'; return None
-        if not self.healthy or not self.ready: self.state = 'DEGRADED'; return None
+        if not self.healthy or not self.ready:
+            self.restore_rearm_at=None
+            self.state = 'DEGRADED'; return None
         if self.remote_call: self.state = 'REMOTE_CALL'; return None
         if not self.protected():
             self.local_focus = self.restore_attempted = False
             self.restore_at = None
+            self.restore_rearm_at = None
         elif self.owner == 'linux' and self.source == 'linux':
             self.local_focus = True
             self.restore_at = None
+            if self.restore_attempted and self.restore_rearm_at is None:self.restore_rearm_at=now+30
+            self.rearm_restore(now)
         if self.local_focus and self.protected() and self.source == 'remote' and self.source_kind == 'media' and not self.remote_call:
             if self.inflight:return None
             if self.restore_attempted:
@@ -255,6 +272,7 @@ class Policy:
     def deadline(self, now):
         due = []
         if self.restore_at is not None:due.append(self.restore_at)
+        if self.restore_rearm_at is not None:due.append(self.restore_rearm_at)
         if self.intent:
             due.append(self.intent[1])
             if self.stable_at is not None: due.append(max(self.stable_at + .65, self.cooldown))
