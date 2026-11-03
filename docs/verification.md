@@ -2,6 +2,10 @@
 
 ## 2026-11-03, 0.4.0
 
+- 135 pure/async tests passed locally on Python 3.12. The complete 142-test suite
+  passed in GitHub Actions on Python 3.11 and 3.13 for runtime commit
+  `c7baf05fb78f1ec851aa98e2e82863039c61813a`.
+
 - New regressions cover interrupted-call return/cancellation, stale MPRIS replies,
   owner removal, resume barriers, late snapshots, fatal health, multi-adapter
   discovery, cancelled helpers, invalid inputs, late sink errors and shutdown.

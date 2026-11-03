@@ -26,11 +26,11 @@ This reuses a locally extended MIT-licensed `hacel/airpodsctl` controller. A Pyt
 
 ## Status
 
-Version 0.3 protects active Linux calls/media rather than auto-pausing a local player when iPhone requests ownership. Duplex Discord/Telegram streams and explicitly tagged communication sessions are tracked, including silence/mute grace. A conservative PipeWire fallback covers known media applications and Music/Movie/Video/Game streams without MPRIS; notifications and startup baselines do not create takeover intent.
+Version 0.4 protects active Linux calls/media rather than auto-pausing a local player when iPhone requests ownership. Duplex Discord/Telegram streams and explicitly tagged communication sessions are tracked, including silence/mute grace. A conservative PipeWire fallback covers known media applications and Music/Movie/Video/Game streams without MPRIS; notifications and startup baselines do not create takeover intent.
 
-New playback/call intent can request one controller-guarded `take-media` over remote music. A proven local session can also request one bounded recovery after an autonomous iPhone takeover; repeated contention stops at `LOCAL_CONTESTED`. The automatic path does not use unconditional `take --force`. The controller refreshes status and rejects calls/unknown types before changing ownership.
+New playback/call intent can request one controller-guarded `take-media` over remote music. A proven local session can also request one bounded recovery after an autonomous iPhone takeover; repeated contention stops at `LOCAL_CONTESTED`. The restore budget re-arms only after 30 seconds of sustained local ownership, or explicit manual return. The automatic path does not use unconditional `take --force`. The controller refreshes status and rejects calls/unknown types before changing ownership.
 
-A2DP transport state is insufficient evidence of working audio. Paused/init output links into the matching AirPods sink are repaired once per link generation, without rebuilding the microphone/effect chain or disconnecting Bluetooth. Old intents/focus are discarded on sleep; resume refreshes the graph. There are 120 Python regression tests plus controller core tests.
+A2DP transport state is insufficient evidence of working audio. Paused/init output links into the matching AirPods sink are repaired once per link generation, without rebuilding the microphone/effect chain or disconnecting Bluetooth. Old intents/focus are discarded on sleep; resume refreshes the graph. There are 142 Python regression tests plus 40 controller core tests.
 
 Manual repair of the specific stalled output links was hearing-confirmed on one setup; the automatic repair was observed in logs. Full repeated hardware cycles, PC calls, sleep/resume, other models/adapters and ARM remain unverified. This does not implement Apple's closed cross-device arbiter or guarantee interruption-free ownership. It is an experimental project, not a stable-release claim.
 
