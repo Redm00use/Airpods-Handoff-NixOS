@@ -2,13 +2,13 @@ import os
 os.environ.setdefault('AIRPODS_DEVICE','AA:BB:CC:DD:EE:FF')
 import asyncio,time,unittest
 from unittest.mock import AsyncMock,patch
-from airpods_handoff import Adapter
+from airpods_handoff import Adapter, MAC
 
 class Latency(unittest.IsolatedAsyncioTestCase):
     def adapter(self):
         a=Adapter(False);p=a.policy;p.connected=p.ready=p.healthy=True;p.owner='linux';p.source='none';p.generation=1
         p.players={'music':True};p.streams={'music'};a.transport='idle'
-        a.nodes={8:{'type':'PipeWire:Interface:Node','info':{'state':'error','props':{'media.class':'Audio/Sink','node.name':'bluez_output.AA_BB_CC_DD_EE_FF.1'}}}}
+        a.nodes={8:{'type':'PipeWire:Interface:Node','info':{'state':'error','props':{'media.class':'Audio/Sink','node.name':f'bluez_output.{MAC}.1'}}}}
         a.snapshot=AsyncMock();a.transport_state=AsyncMock()
         return a
     def ready(self,a):

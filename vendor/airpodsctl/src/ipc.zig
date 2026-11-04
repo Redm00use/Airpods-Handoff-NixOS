@@ -17,8 +17,8 @@ const response_magic_v2 = "APR2";
 const response_magic_v3 = "APR3";
 const socket_suffix = "/airpodsctl.sock";
 const packet_size = 512;
-// The service may spend its full three-second AirPods deadline before returning a bounded failure.
-const request_timeout_ms = 5000;
+// Allow one cold connection (10s), a fresh operation (3s), and IPC overhead.
+const request_timeout_ms = 20000;
 
 pub const Error = error{ Unavailable, IpcFailure };
 
@@ -174,6 +174,9 @@ pub fn encodeRequest(buffer: []u8, value: cli.Command) error{InvalidRequest}![]c
                 .status => 1,
                 .take => 2,
                 .take_media => 4,
+                .take_call => 5,
+                .call_start => 6,
+                .call_end => 7,
                 .release => 3,
             };
             buffer[payload + 1] = @intFromBool(switching_request.force);
@@ -247,6 +250,9 @@ pub fn decodeRequest(packet: []const u8) error{InvalidRequest}!Request {
                     2 => .take,
                     3 => .release,
                     4 => .take_media,
+                    5 => .take_call,
+                    6 => .call_start,
+                    7 => .call_end,
                     else => return error.InvalidRequest,
                 };
                 if (packet[payload + 1] != 0 and action != .take) return error.InvalidRequest;

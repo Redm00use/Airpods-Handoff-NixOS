@@ -17,7 +17,7 @@ class Tests(unittest.TestCase):
         p=self.ready();p.owner='linux';self.play(p)
         self.assertIsNone(p.decide(1.7));self.assertTrue(p.leased)
         p.player(2,'a',False);p.decide(2)
-        self.assertEqual(p.decide(6.1),'release')
+        self.assertIsNone(p.decide(6.1));self.assertEqual(p.owner,'linux')
     def test_short_sound_and_no_stream(self):
         p=self.ready();self.play(p);p.player(1.3,'a',False);self.assertIsNone(p.decide(2))
         p.player(3,'a',True);p.streams.clear();self.assertIsNone(p.decide(5))
@@ -38,7 +38,7 @@ class Tests(unittest.TestCase):
         p=self.ready();p.leased=True;p.owner='linux';p.player(1,'a',False)
         p.decide(2);self.assertIsNone(p.decide(5));self.play(p,5.5);self.assertIsNone(p.decide(8))
     def test_failed_release_never_loops(self):
-        p=self.ready();p.leased=True;p.owner='linux';p.decide(1)
+        p=self.ready();p.prefer_idle_pc=False;p.leased=True;p.owner='linux';p.decide(1)
         self.assertEqual(p.decide(6),'release');p.result(6,'release',False)
         self.assertIsNone(p.decide(30));self.assertIsNone(p.decide(60))
     def test_disconnect_and_new_generation_cancel(self):

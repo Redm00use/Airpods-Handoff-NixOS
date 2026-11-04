@@ -1,5 +1,33 @@
 # Changelog
 
+## Local merge — 2026-11-04
+
+- Incorporate upstream MPRIS revision/owner fences and string PipeWire client IDs.
+- Fence resume baselines, preserve authenticated generations on duplicate BlueZ signals, validate routing/graph input.
+- Reap helpers, restore interrupted edge deletions, close service resources and detect late sink errors.
+- Report evidence-based media modes and shadow status in the existing panel; honor XDG_CONFIG_HOME.
+- Preserve the newer control-only background connection, native call reports, manual iPhone selection and bounded call recovery.
+- 223 Python tests passed; no new acoustic call-stability claim.
+
+## Unreleased — continuing call priority
+
+- Preserve proven PC call recovery rights across AACP generations, with fresh commands and a three-attempt budget.
+- Typed take-call command revalidates source and rejects unknown; queued commands are cancelled on hangup.
+- Broader browser duplex detection; call evidence/conflict status exposed to the panel.
+- Suspend clears old call rights; no blanket claim of full Apple behavior.
+
+
+## Unreleased — background connection
+
+- Control-only background AACP connection with backoff; no audio-profile/ownership command on connect.
+- WirePlumber automatic profile connection disabled only for the selected device.
+- A2DP opened on demand after local ownership; initial background-profile design rejected by hardware test.
+- Prefer PC when both hosts are explicitly idle; revalidate before non-forced take.
+- Cancel stale connection work and prevent stale phone-call state from blocking resume.
+- Connection status and error diagnostics included in the panel protocol.
+- Hardware validation in progress; no claim of complete Apple Automatic Switching.
+
+
 ## 0.3.0 — 2026-10-29
 
 - Persistent manual pin/auto mode and one explicit return attempt after contention.

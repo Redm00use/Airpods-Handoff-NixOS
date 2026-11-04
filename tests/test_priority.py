@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock
 from airpods_call_detection import CallTracker,call_sessions
-from airpods_handoff import Adapter
+from airpods_handoff import Adapter, MAC
 from airpods_handoff_policy import Policy
 
 def node(cls,pid=10,state='running',binary='DiscordCanary',**props):
@@ -102,7 +102,7 @@ class OutputLinkRepair(unittest.IsolatedAsyncioTestCase):
     def setup_graph(self):
         a=Adapter(False);p=a.policy;p.connected=p.ready=p.healthy=True;p.owner=p.source='linux';p.generation=1
         p.players={'cider':True};p.streams={'cider'}
-        a.nodes={8:{'type':'PipeWire:Interface:Node','info':{'state':'running','props':{'media.class':'Audio/Sink','node.name':'bluez_output.AA_BB_CC_DD_EE_FF.1'}}},9:{'type':'PipeWire:Interface:Node','info':{'state':'running','props':{'application.id':'com.github.wwmm.easyeffects'}}},10:{'type':'PipeWire:Interface:Link','info':{'state':'paused','input-node-id':8,'output-node-id':9,'output-port-id':20,'input-port-id':21,'props':{'object.serial':100}}}}
+        a.nodes={8:{'type':'PipeWire:Interface:Node','info':{'state':'running','props':{'media.class':'Audio/Sink','node.name':f'bluez_output.{MAC}.1'}}},9:{'type':'PipeWire:Interface:Node','info':{'state':'running','props':{'application.id':'com.github.wwmm.easyeffects'}}},10:{'type':'PipeWire:Interface:Link','info':{'state':'paused','input-node-id':8,'output-node-id':9,'output-port-id':20,'input-port-id':21,'props':{'object.serial':100}}}}
         a.link_command=AsyncMock(return_value=True);return a
     async def test_paused_effect_output_repaired_once(self):
         a=self.setup_graph();ctx=a.policy.context()

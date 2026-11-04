@@ -2,7 +2,7 @@ import os
 os.environ.setdefault('AIRPODS_DEVICE','AA:BB:CC:DD:EE:FF')
 import asyncio, unittest
 from unittest.mock import AsyncMock, patch
-from airpods_handoff import Adapter
+from airpods_handoff import Adapter, MAC
 
 async def timeout_immediately(awaitable,*args,**kwargs):
     if hasattr(awaitable,'close'):awaitable.close()
@@ -12,12 +12,13 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     def setup_audio(self):
         a=Adapter(False);p=a.policy;p.connected=p.ready=p.healthy=True;p.owner='linux';p.source='remote';p.generation=1
         p.players={'music':True};p.streams={'music'}
-        a.nodes={8:{'type':'PipeWire:Interface:Node','info':{'state':'error','props':{'media.class':'Audio/Sink','node.name':'bluez_output.AA_BB_CC_DD_EE_FF.1'}}}}
+        a.nodes={8:{'type':'PipeWire:Interface:Node','info':{'state':'error','props':{'media.class':'Audio/Sink','node.name':f'bluez_output.{MAC}.1'}}}}
         a.snapshot=AsyncMock();a.transport_state=AsyncMock(return_value='idle');a.pulse=AsyncMock(return_value=True)
         return a
     async def test_resume_connected_but_unsynced_still_requests_snapshot(self):
         from dbus_next import Variant
         a=self.setup_audio();a.system=object();a.policy.ready=False;a.policy.generation=None
+        a.connection.device_path=f'/org/bluez/hci2/dev_{MAC}'
         a.call=AsyncMock(return_value=[Variant('b',True)])
         async def snapshot():a.policy.ready=True;a.policy.generation=2
         a.snapshot=AsyncMock(side_effect=snapshot)
@@ -30,7 +31,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch('airpods_handoff.asyncio.wait_for',timeout_immediately):
             await a.ensure_audio(a.policy.context(),0)
             await a.ensure_audio(a.policy.context(),0)
-        self.assertEqual([x.args for x in a.pulse.await_args_list],[('suspend-sink','bluez_output.AA_BB_CC_DD_EE_FF.1','1'),('suspend-sink','bluez_output.AA_BB_CC_DD_EE_FF.1','0')])
+        self.assertEqual([x.args for x in a.pulse.await_args_list],[('suspend-sink',f'bluez_output.{MAC}.1','1'),('suspend-sink',f'bluez_output.{MAC}.1','0')])
     async def test_remote_takeover_always_undoes_our_suspend(self):
         a=self.setup_audio()
         async def pulse(*args):

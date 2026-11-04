@@ -67,7 +67,12 @@ pub const AudioSourceState = enum(u8) {
     _,
 
     pub fn kindName(self: AudioSourceState) []const u8 {
-        return switch (self) { .idle => "idle", .in_call => "call", .playing => "media", else => "unknown" };
+        return switch (self) {
+            .idle => "idle",
+            .in_call => "call",
+            .playing => "media",
+            else => "unknown",
+        };
     }
 
     pub fn remoteActivity(self: AudioSourceState) RemoteActivity {
@@ -112,6 +117,7 @@ pub const Status = struct {
 };
 
 pub const State = struct {
+    peer_address: ?Address = null,
     source: Owner = .unknown,
     source_kind: AudioSourceState = @enumFromInt(255),
     hosts: Hosts = .unknown,
@@ -135,6 +141,10 @@ pub const State = struct {
         local_address: Address,
     ) void {
         var local_count: usize = 0;
+        self.peer_address = null;
+        if (devices.count == 2) for (devices.addresses[0..devices.count]) |address| {
+            if (!std.mem.eql(u8, &address, &local_address)) self.peer_address = address;
+        };
 
         for (devices.addresses[0..devices.count]) |address| {
             if (std.mem.eql(u8, &address, &local_address)) local_count += 1;
@@ -180,6 +190,13 @@ pub const State = struct {
         if (self.source_kind != .idle and self.source_kind != .playing) return false;
         return observed.remote_activity == .idle or
             (observed.remote_activity == .active and self.source == .remote and self.source_kind == .playing);
+    }
+
+    // Used only for a previously proven local call lease by the external FSM.
+    // Re-query source first; unlike unrestricted --force, unknown is forbidden.
+    pub fn allowsCallTake(self: State) bool {
+        return self.status().isReady() and (self.source_kind == .idle or
+            self.source_kind == .playing or (self.source == .linux and self.source_kind == .in_call));
     }
 
     pub fn status(self: State) Status {
@@ -279,10 +296,127 @@ pub fn sendRelay(
     try session.send(frame.packet());
 }
 
-
 // Firmware-specific relay layouts vary. This bounded, framed marker only authorizes yielding.
 pub fn isReleaseRequest(packet: []const u8) bool {
     if (packet.len < 6 or packet.len > 1024) return false;
-    if (!std.mem.eql(u8, packet[0..6], &.{0x04,0x00,0x04,0x00,0x11,0x00})) return false;
+    if (!std.mem.eql(u8, packet[0..6], &.{ 0x04, 0x00, 0x04, 0x00, 0x11, 0x00 })) return false;
     return std.mem.indexOf(u8, packet[6..], "SetOwnershipToFalse") != null;
+}
+
+// OPACK field/packet facts independently implemented from observed iPhone reports:
+// https://github.com/zackb/tether/blob/main/docs/BLUETOOTH.md#smart-routing
+// Category 501 means an ongoing call, including silence; 100 withdraws it.
+fn shortString(buffer: []u8, offset: *usize, value: []const u8) void {
+    std.debug.assert(value.len <= 32);
+    buffer[offset.*] = 0x40 + @as(u8, @intCast(value.len));
+    offset.* += 1;
+    @memcpy(buffer[offset.*..][0..value.len], value);
+    offset.* += value.len;
+}
+
+pub fn callReport(buffer: *[256]u8, local: Address, active: bool) []const u8 {
+    var n: usize = 1;
+    buffer[0] = 0xe5;
+    shortString(buffer, &n, "playingApp");
+    shortString(buffer, &n, if (active) "Linux Call" else "Unknown");
+    shortString(buffer, &n, "hostStreamingState");
+    shortString(buffer, &n, if (active) "YES" else "NO");
+    shortString(buffer, &n, "btAddress");
+    var address: [17]u8 = undefined;
+    const formatted = std.fmt.bufPrint(&address, "{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}", .{ local[0], local[1], local[2], local[3], local[4], local[5] }) catch unreachable;
+    shortString(buffer, &n, formatted);
+    shortString(buffer, &n, "btName");
+    shortString(buffer, &n, "Linux");
+    shortString(buffer, &n, "otherDeviceAudioCategory");
+    if (active) {
+        buffer[n..][0..3].* = .{ 0x31, 0xf5, 0x01 };
+        n += 3;
+    } else {
+        buffer[n..][0..2].* = .{ 0x30, 100 };
+        n += 2;
+    }
+    return buffer[0..n];
+}
+
+// A native peer yield request, separate from the AirPods ownership bit.
+// Field/value facts: Tether smart_routing_hijack and LibrePods Hijackv2.
+// Keep the call report and its yield request consistent: the sender's two
+// category/score fields both identify the proven PC call (501), not media (301).
+// Peer category is a routing hint only; it never authorizes a takeover.
+pub fn peerYield(buffer: *[256]u8, peer_category: u16) []const u8 {
+    var n: usize = 1;
+    buffer[0] = 0xe5;
+    shortString(buffer, &n, "localscore");
+    if (peer_category <= 255) {
+        buffer[n..][0..2].* = .{ 0x30, @intCast(peer_category) };
+        n += 2;
+    } else {
+        buffer[n] = 0x31;
+        std.mem.writeInt(u16, buffer[n + 1 ..][0..2], peer_category, .little);
+        n += 3;
+    }
+    shortString(buffer, &n, "reason");
+    shortString(buffer, &n, "Hijackv2");
+    shortString(buffer, &n, "audioRoutingScore");
+    buffer[n..][0..3].* = .{ 0x31, 0xf5, 0x01 };
+    n += 3;
+    shortString(buffer, &n, "audioRoutingSetOwnershipToFalse");
+    buffer[n] = 1;
+    n += 1;
+    shortString(buffer, &n, "remotescore");
+    buffer[n..][0..3].* = .{ 0x31, 0xf5, 0x01 };
+    n += 3;
+    return buffer[0..n];
+}
+
+// Native first-contact host announcement. It precedes call metadata so the
+// peer knows which paired host is reporting. Emitted only for a proven PC call.
+pub fn callRegistration(buffer: *[256]u8, local: Address) []const u8 {
+    var n: usize = 1;
+    buffer[0] = 0xe5;
+    shortString(buffer, &n, "idleTime");
+    buffer[n..][0..2].* = .{ 0x30, 0 };
+    n += 2;
+    shortString(buffer, &n, "newTipi");
+    buffer[n] = 1;
+    n += 1;
+    shortString(buffer, &n, "btAddress");
+    var address: [17]u8 = undefined;
+    const formatted = std.fmt.bufPrint(&address, "{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}:{X:0>2}", .{ local[0], local[1], local[2], local[3], local[4], local[5] }) catch unreachable;
+    shortString(buffer, &n, formatted);
+    shortString(buffer, &n, "btName");
+    shortString(buffer, &n, "Linux");
+    shortString(buffer, &n, "nearbyAudioScore");
+    buffer[n..][0..2].* = .{ 0x30, 6 };
+    n += 2;
+    return buffer[0..n];
+}
+
+pub fn isManualRouteRequest(packet: []const u8) bool {
+    return smart_routing_relay.isManualRouteRequest(packet);
+}
+
+pub fn automaticRequest(packet: []const u8) ?Relay {
+    return smart_routing_relay.automaticRequest(packet);
+}
+
+// A routing score reply is not a counter-takeover: it reports the existing call
+// to the requesting peer before that peer decides whether to switch the buds.
+pub fn callScoreReply(buffer: *[256]u8) []const u8 {
+    return callScoreAnnouncement(buffer, true);
+}
+
+// Explicit lifecycle announcement, not an echo of peer score reports.
+pub fn callScoreAnnouncement(buffer: *[256]u8, active: bool) []const u8 {
+    var n: usize = 1;
+    buffer[0] = 0xe1;
+    shortString(buffer, &n, "audioRoutingScore");
+    if (active) {
+        buffer[n..][0..3].* = .{ 0x31, 0xf5, 0x01 };
+        n += 3;
+    } else {
+        buffer[n..][0..2].* = .{ 0x30, 100 };
+        n += 2;
+    }
+    return buffer[0..n];
 }

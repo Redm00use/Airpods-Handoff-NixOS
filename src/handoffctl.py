@@ -26,7 +26,7 @@ def request(action='status'):
 
 def main():
     parser=argparse.ArgumentParser(description='AirPods status, manual return and Linux priority')
-    parser.add_argument('action',nargs='?',default='status',choices=('status','watch','pin','auto','return'))
+    parser.add_argument('action',nargs='?',default='status',choices=('status','watch','pin','auto','return','connect','disconnect'))
     return request(parser.parse_args().action)
 
 if __name__=='__main__':sys.exit(main())

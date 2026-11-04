@@ -8,9 +8,10 @@ The new Python adapter, FSM, Nix packaging, module, tests and documentation are 
 
 ## Technical references (not bundled or launched)
 
-- [airpods-tui](https://github.com/annoyedmilk/airpods-tui), reviewed at `8af4eb20cbc39c33983d70c0518753db13f0bbfa`: distinction between ownership ACK and audio source; sink-level stream restart.
+- [airpods-tui](https://github.com/annoyedmilk/airpods-tui), reviewed at `8af4eb20cbc39c33983d70c0518753db13f0bbfa`: distinction between ownership ACK and audio source; sink-level stream restart; explicit authenticated BR/EDR L2CAP security configuration.
 - [earport-handoff](https://github.com/pika-02-03/earport-handoff), reviewed at `1d55f5cf51fa44f3a139e1df4ca2b5a2a6ace436`: sticky remote yield across transient NONE; framed peer release marker.
 - [LibrePods](https://github.com/librepods-org/librepods): public reverse-engineering context and DeviceID/multipoint findings.
+- [Tether smart-routing observations](https://github.com/zackb/tether/blob/main/docs/BLUETOOTH.md#smart-routing): relay length includes the OPACK version byte; native audio category 501 for calls and 100 for idle. Relay and generic Hijackv2 OPACK field/value facts used for independent encoders; no Tether code is bundled.
 - [MPRIS specification](https://specifications.freedesktop.org/mpris/latest/Player_Interface.html).
 - [PipeWire pw-dump documentation](https://docs.pipewire.org/page_man_pw-dump_1.html).
 

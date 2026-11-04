@@ -12,9 +12,9 @@ class ManualPolicy(unittest.TestCase):
     def test_pin_holds_while_idle_and_defers_peer(self):
         p=self.ready();p.set_pin(0,True);p.peer_request(1)
         for t in (1,10,100):self.assertIsNone(p.decide(t));self.assertEqual(p.state,'LOCAL_PINNED')
-    def test_unpin_allows_normal_idle_release(self):
+    def test_unpin_keeps_pc_when_phone_is_idle(self):
         p=self.ready();p.set_pin(0,True);p.decide(0);p.set_pin(1,False);p.decide(1)
-        self.assertEqual(p.decide(5.1),'release')
+        self.assertIsNone(p.decide(5.1));self.assertEqual(p.owner,'linux')
     def test_manual_return_rearms_contested_but_is_one_request(self):
         p=self.ready();p.owner=p.source='remote';p.remote='active';p.source_kind='media';p.state='LOCAL_CONTESTED';p.restore_attempted=True
         p.manual_request(1);p.decide(1);self.assertEqual(p.decide(1.7),'claim');self.assertTrue(p.inflight_manual)
@@ -27,9 +27,9 @@ class ManualPolicy(unittest.TestCase):
         p=self.ready();p.owner=p.source='remote';p.remote='active';p.remote_call=True;p.source_kind='call'
         p.set_pin(0,True)
         for t in (0,1,10):self.assertIsNone(p.decide(t))
-    def test_manual_return_without_media_expires_then_releases(self):
+    def test_manual_return_without_media_keeps_idle_default(self):
         p=self.ready();p.leased=True;p.manual_request(0);p.decide(0);self.assertIsNone(p.decide(.7));self.assertFalse(p.manual_pending)
-        p.decide(1);self.assertEqual(p.decide(5.1),'release')
+        p.decide(1);self.assertIsNone(p.decide(5.1));self.assertEqual(p.owner,'linux')
     def test_manual_pause_does_not_cancel_user_request(self):
         p=self.ready();p.owner=p.source='remote';p.remote='idle';p.manual_request(0);p.decide(0);p.decide(.7);token=p.inflight_token
         p.player(.8,'music',False);self.assertTrue(p.valid(token))
@@ -73,3 +73,27 @@ class Controls(unittest.IsolatedAsyncioTestCase):
     async def test_status_does_not_claim_audible_from_owner_ack(self):
         self.a.policy.local_call=True;self.a.policy.source='remote'
         result=await self.request('status');self.assertFalse(result['audio_active']);self.assertNotEqual(result['title'],'Звонок на ПК')
+
+class ExplicitAudioReturn(unittest.IsolatedAsyncioTestCase):
+    async def test_return_repairs_owned_idle_source_but_not_remote_or_unknown(self):
+        for source,kind,remote,expected in [('none','idle','idle',True),('unknown','idle','idle',False),('remote','media','active',False),('linux','media','idle',True)]:
+            with self.subTest(source=source):
+                a=Adapter(False);p=a.policy
+                p.connected=p.ready=p.healthy=p.call_healthy=True
+                p.owner='linux';p.source=source;p.source_kind=kind;p.remote=remote
+                p.local_call=p.call_proven=True;p.generation=1
+                a.evaluate=lambda _:p.decide(asyncio.get_running_loop().time())
+                a.ensure_audio=AsyncMock()
+                control=ControlServer(a,runtime='/tmp',preferences='/tmp/unused-airpods-test-preferences')
+                control.action('return')
+                await asyncio.gather(*list(a.tasks))
+                self.assertEqual(a.ensure_audio.await_count,int(expected))
+
+    async def test_phone_call_without_local_authority_stays_blocked(self):
+        a=Adapter(False);p=a.policy
+        p.connected=p.ready=p.healthy=True;p.owner='linux';p.source='remote'
+        p.source_kind='call';p.remote='active';p.remote_call=True
+        a.ensure_audio=AsyncMock()
+        control=ControlServer(a,runtime='/tmp',preferences='/tmp/unused-airpods-test-preferences')
+        with self.assertRaises(ValueError):control.action('return')
+        a.ensure_audio.assert_not_awaited()

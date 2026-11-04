@@ -14,6 +14,7 @@ const wear_policy = @import("wear_policy");
 
 const c = support.c;
 const operation_timeout_ms = 3000;
+const connection_timeout_ms = 10000;
 const ipc_reply_timeout_ms = 1000;
 const initialization_delay_ms = 150;
 const idle_poll_ms = 1000;
@@ -37,6 +38,7 @@ const Connection = struct {
 
 const Server = struct {
     release_requested: bool = false,
+    manual_route_requested: bool = false,
     event_sequence: u64 = 0,
     event_generation: u64 = 0,
     requested_address: ?[]const u8,
@@ -66,17 +68,16 @@ const Server = struct {
         if (fd < 0) return;
         defer _ = c.close(fd);
         const status = if (self.connection) |connection| connection.control.state.routing.status() else routing.Status{
-            .hosts = .unknown, .owner = .unknown, .remote_activity = .unknown,
+            .hosts = .unknown,
+            .owner = .unknown,
+            .remote_activity = .unknown,
         };
         const source = if (self.connection) |connection| connection.control.state.routing.source.name() else "unknown";
         const kind = if (self.connection) |connection| connection.control.state.routing.source_kind.kindName() else "unknown";
         self.event_sequence += 1;
         var buffer: [512]u8 = undefined;
-        const data = std.fmt.bufPrint(&buffer,
-            "{{\"version\":2,\"sequence\":{d},\"generation\":{d},\"connected\":{s},\"ready\":{s},\"hosts\":\"{s}\",\"owner\":\"{s}\",\"remote_activity\":\"{s}\",\"source\":\"{s}\",\"source_kind\":\"{s}\",\"release_request\":{s}}}",
-            .{self.event_sequence, self.event_generation, if (connected) "true" else "false", if (connected and status.isReady()) "true" else "false", status.hosts.name(), status.owner.name(), status.remote_activity.name(), source, kind, if (self.release_requested) "true" else "false"}) catch return;
-        _ = c.sendto(fd, data.ptr, data.len, c.MSG_NOSIGNAL | c.MSG_DONTWAIT,
-            .{ .__sockaddr__ = @ptrCast(&address) }, @sizeOf(c.struct_sockaddr_un));
+        const data = std.fmt.bufPrint(&buffer, "{{\"version\":2,\"sequence\":{d},\"generation\":{d},\"connected\":{s},\"ready\":{s},\"hosts\":\"{s}\",\"owner\":\"{s}\",\"remote_activity\":\"{s}\",\"source\":\"{s}\",\"source_kind\":\"{s}\",\"release_request\":{s},\"manual_request\":{s}}}", .{ self.event_sequence, self.event_generation, if (connected) "true" else "false", if (connected and status.isReady()) "true" else "false", status.hosts.name(), status.owner.name(), status.remote_activity.name(), source, kind, if (self.release_requested) "true" else "false", if (self.manual_route_requested) "true" else "false" }) catch return;
+        _ = c.sendto(fd, data.ptr, data.len, c.MSG_NOSIGNAL | c.MSG_DONTWAIT, .{ .__sockaddr__ = @ptrCast(&address) }, @sizeOf(c.struct_sockaddr_un));
     }
 
     fn needsPersistentConnection(self: *const Server) bool {
@@ -421,6 +422,13 @@ const Server = struct {
                     self.transport_recovery_explicit = false;
                 }
             },
+            .manual_route_requested => {
+                self.release_requested = true;
+                self.manual_route_requested = true;
+                self.publishRouting(true);
+                self.release_requested = false;
+                self.manual_route_requested = false;
+            },
             .release_requested => {
                 self.release_requested = true;
                 self.publishRouting(true);
@@ -441,8 +449,12 @@ const Server = struct {
             "Looking for connected AirPods because the service needs a live control session for client requests and enabled policies.",
             .{},
         );
-        const deadline_ms = transport.nowMs() + operation_timeout_ms;
-        const address = try bluez.discover(self.requested_address, &self.failure);
+        // Paging a disconnected pair has its own budget, separate from routing commands.
+        const deadline_ms = transport.nowMs() + connection_timeout_ms;
+        const address = if (self.switching.mode == .external)
+            try bluez.discoverPairedControl(self.requested_address, &self.failure)
+        else
+            try bluez.discover(self.requested_address, &self.failure);
         const fd = try bluez.openControlChannel(address, deadline_ms, &self.failure);
         errdefer bluez.close(fd);
         support.log(
@@ -687,6 +699,13 @@ const Server = struct {
             .{request.operation.name()},
         );
 
+        // Never execute an old ownership/call-state intent after a slow cold connect.
+        // Read-only status establishes AACP first; policy must then revalidate the intent.
+        if (self.connection == null and request.operation.requiresLiveRouting()) {
+            self.failure.set("routing control unavailable; reconnect and retry with fresh intent", .{});
+            self.replyFailure(client, request.version);
+            return;
+        }
         if (self.connection == null) self.connect() catch {
             support.log(
                 .warn,
@@ -712,7 +731,7 @@ const Server = struct {
             }
         }
 
-        const result = self.connection.?.control.runWithObserver(request.operation, deadline_ms, .{
+        const result = self.connection.?.control.runWithObserver(request.operation, transport.nowMs() + operation_timeout_ms, .{
             .context = self,
             .callback = observeControllerEvent,
         }) catch |err| {
@@ -728,8 +747,8 @@ const Server = struct {
             return;
         };
         if (request.operation == .switching) switch (request.operation.switching.action) {
-            .status => {},
-            .take, .take_media => {
+            .status, .call_start, .call_end => {},
+            .take, .take_media, .take_call => {
                 if (self.switching.mode != .external) self.switching.takeSucceeded(transport.nowMs());
                 self.reportTakeTransport("the explicit ownership acknowledgement");
                 self.scheduleTransportRecovery(true);
@@ -770,8 +789,9 @@ const Server = struct {
     }
 
     fn run(self: *Server, listener: c_int) Error!void {
-        // Connect eagerly for fast first use, but remain available while the AirPods are absent.
-        self.connect() catch {
+        // External policy owns the single background connect flight. Do not spend
+        // a second paging budget before its first queued status request is handled.
+        if (self.switching.mode != .external) self.connect() catch {
             support.log(
                 .warn,
                 "The initial AirPods connection is unavailable because discovery or control-session initialization failed; the session listener remains ready for later requests.",

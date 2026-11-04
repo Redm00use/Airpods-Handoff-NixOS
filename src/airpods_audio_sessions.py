@@ -10,9 +10,20 @@ EXCLUDED_ROLES={'notification','event','communication','production','filter','ds
 MEDIA_ROLES={'music','movie','video','game'}
 MEDIA_BINARIES=('cider','spotify','firefox','zen','chromium','chrome','vlc','mpv','celluloid','rhythmbox','strawberry','audacious','lollypop')
 
+def media_mode(props):
+    """Describe evidence, without guessing whether an untagged browser plays video."""
+    role=str(props.get('media.role','')).lower()
+    if role in ('movie','video'):return 'video'
+    if role in ('music','game'):return role
+    identity=' '.join(str(props.get(k,'')) for k in ('application.name','application.process.binary','application.id')).lower()
+    if any(word in identity for word in ('cider','spotify','rhythmbox','strawberry','audacious','lollypop')):return 'music'
+    return 'media'
+
 def stream_props(objects,obj):
     info=obj.get('info') or {};p=info.get('props') or {}
-    client=(objects.get(p.get('client.id'),{}).get('info') or {}).get('props') or {}
+    client_id=p.get('client.id')
+    if isinstance(client_id,str) and client_id.isdecimal():client_id=int(client_id)
+    client=(objects.get(client_id,{}).get('info') or {}).get('props') or {}
     return {**client,**p}
 
 def muted(info):

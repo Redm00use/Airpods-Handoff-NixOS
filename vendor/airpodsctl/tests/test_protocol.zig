@@ -80,6 +80,8 @@ const PersistentEmulatorContext = struct {
 };
 
 const RoutingExchange = struct {
+    manual_during_refresh: bool = false,
+    previous_score: ?bool = null,
     request: operations.Switching,
     initial_owner: bool,
     send_initial_ownership: bool = true,
@@ -97,10 +99,11 @@ const RoutingEmulatorContext = struct {
 const RoutingExchangeResult = struct {
     result: ?smart_routing.Status,
     failure: support.ErrorMessage,
+    announced_score: ?bool = null,
 };
 
 fn receiveExpected(fd: c_int, expected: []const u8) bool {
-    var packet: [128]u8 = undefined;
+    var packet: [1024]u8 = undefined;
     const received = c.recv(fd, &packet, packet.len, 0);
 
     return received == expected.len and std.mem.eql(u8, packet[0..@intCast(received)], expected);
@@ -277,6 +280,11 @@ fn sendOwnership(fd: c_int, owns: bool) bool {
     return c.send(fd, &packet, packet.len, 0) == packet.len;
 }
 
+fn sendManualRoute(fd: c_int) bool {
+    const packet = smart_routing_relay.encode(.receive, .{ 12, 11, 10, 9, 8, 7 }, 1, "\xe2\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x4bManualRoute") catch return false;
+    return c.send(fd, packet.packet().ptr, packet.packet().len, 0) == packet.packet().len;
+}
+
 fn sendRoutingSnapshot(fd: c_int, exchange: *const RoutingExchange) bool {
     const audio_source_request = [_]u8{ 0x04, 0x00, 0x04, 0x00, 0x0d, 0x00 };
     const connected_devices_request = [_]u8{ 0x04, 0x00, 0x04, 0x00, 0x2d, 0x00 };
@@ -296,6 +304,7 @@ fn sendRoutingSnapshot(fd: c_int, exchange: *const RoutingExchange) bool {
     };
 
     return receiveExpected(fd, &audio_source_request) and
+        (!exchange.manual_during_refresh or sendManualRoute(fd)) and
         c.send(fd, &audio_source, audio_source.len, 0) == audio_source.len and
         receiveExpected(fd, &connected_devices_request) and
         (!exchange.send_initial_ownership or sendOwnership(fd, exchange.initial_owner)) and
@@ -304,18 +313,44 @@ fn sendRoutingSnapshot(fd: c_int, exchange: *const RoutingExchange) bool {
 
 fn emulateRoutingExchange(fd: c_int, exchange: *const RoutingExchange) u8 {
     if (!receiveInitialization(fd) or !sendRoutingSnapshot(fd, exchange)) return 1;
-    if (exchange.request.action == .status or
+    if ((exchange.manual_during_refresh and (exchange.request.action == .take or exchange.request.action == .take_media or exchange.request.action == .take_call or exchange.request.action == .call_start)) or
+        exchange.request.action == .status or
         (exchange.send_initial_ownership and exchange.request.action == .take and exchange.initial_owner) or
         (!exchange.send_initial_ownership and exchange.request.action == .take and
             exchange.request.force and exchange.initial_owner) or
         (exchange.send_initial_ownership and exchange.request.action == .release and !exchange.initial_owner) or
         (exchange.request.action == .take and !exchange.request.force and exchange.activity != .idle) or
-        (exchange.request.action == .take_media and exchange.activity != .idle and exchange.activity != .playing))
+        (exchange.request.action == .take_media and exchange.activity != .idle and exchange.activity != .playing) or
+        (exchange.request.action == .take_call and exchange.activity != .idle and exchange.activity != .playing and !(exchange.source_is_local and exchange.activity == .in_call)))
     {
         return 0;
     }
 
-    const target_owns = exchange.request.action == .take or exchange.request.action == .take_media;
+    if (exchange.request.action == .take_call or exchange.request.action == .call_start or exchange.request.action == .call_end) {
+        var body: [256]u8 = undefined;
+        const active = exchange.request.action != .call_end;
+        if (active) {
+            const registration = smart_routing_relay.encode(.send, .{ 12, 11, 10, 9, 8, 7 }, 1, smart_routing.callRegistration(&body, .{ 1, 2, 3, 4, 5, 6 })) catch return 6;
+            if (!receiveExpected(fd, registration.packet())) return 6;
+        }
+        const report = smart_routing_relay.encode(.send, .{ 12, 11, 10, 9, 8, 7 }, 1, smart_routing.callReport(&body, .{ 1, 2, 3, 4, 5, 6 }, active)) catch return 4;
+        if (!receiveExpected(fd, report.packet())) return 4;
+        if (exchange.previous_score == null or exchange.previous_score.? != active) {
+            const score = smart_routing_relay.encode(.send, .{ 12, 11, 10, 9, 8, 7 }, 1, smart_routing.callScoreAnnouncement(&body, active)) catch return 7;
+            if (!receiveExpected(fd, score.packet())) return 7;
+        }
+        if (active) {
+            const yield = smart_routing_relay.encode(.send, .{ 12, 11, 10, 9, 8, 7 }, 1, smart_routing.peerYield(&body, if (exchange.source_is_local) 100 else switch (exchange.activity) {
+                .in_call => 501,
+                .playing => 301,
+                else => 100,
+            })) catch return 5;
+            if (!receiveExpected(fd, yield.packet())) return 5;
+        }
+        if (exchange.request.action != .take_call) return 0;
+    }
+
+    const target_owns = exchange.request.action == .take or exchange.request.action == .take_media or exchange.request.action == .take_call;
     const ownership_command = [_]u8{
         0x04,                      0x00, 0x04, 0x00, 0x09, 0x00, 0x06,
         @intFromBool(target_owns), 0x00, 0x00, 0x00,
@@ -344,10 +379,12 @@ fn runRoutingExchange(exchange: *const RoutingExchange) !RoutingExchangeResult {
             return failure;
         },
         .local_address = .{ 1, 2, 3, 4, 5, 6 },
+        .announced_call_score = exchange.previous_score,
     };
     if (control.run(.{ .switching = exchange.request }, deadline_ms) catch null) |result| {
         exchange_result.result = result.switching;
     }
+    exchange_result.announced_score = control.announced_call_score;
     _ = c.close(sockets[0]);
     emulator.join();
 
@@ -885,7 +922,7 @@ test "smart-routing relay frames preserve opaque payloads and reject malformed l
     const expected = [_]u8{
         0x04, 0x00, 0x04, 0x00, 0x10, 0x00,
         1,    2,    3,    4,    5,    6,
-        4,    0,    0xaa, 0xd3, 0x01, 0x02,
+        5,    0,    0xaa, 0xd3, 0x01, 0x02,
         0x03,
     };
 
@@ -1244,7 +1281,6 @@ test "wear policy baselines snapshots, transitions, and resets conservatively" {
     try std.testing.expectEqual(wear_policy.Reason.incomplete_state, incomplete.reason);
 }
 
-
 test "unsupported relay does not close control channel or authorize routing" {
     var sockets: [2]c_int = undefined;
     try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_SEQPACKET, 0, &sockets));
@@ -1256,7 +1292,7 @@ test "unsupported relay does not close control channel or authorize routing" {
     };
     try std.testing.expect(receiveInitialization(sockets[1]));
     var unsupported = [_]u8{0} ** 127;
-    @memcpy(unsupported[0..6], &[_]u8{4, 0, 4, 0, 0x11, 0});
+    @memcpy(unsupported[0..6], &[_]u8{ 4, 0, 4, 0, 0x11, 0 });
     try std.testing.expectEqual(@as(isize, unsupported.len), c.send(sockets[1], &unsupported, unsupported.len, 0));
     try std.testing.expect((try control.receiveOne()) == null);
     try std.testing.expectEqual(@as(u64, 0), control.state.routing_generation);
@@ -1265,11 +1301,10 @@ test "unsupported relay does not close control channel or authorize routing" {
     try std.testing.expectEqual(@as(isize, ownership.len), c.send(sockets[1], &ownership, ownership.len, 0));
     try std.testing.expect((try control.receiveOne()) != null);
     try std.testing.expectEqual(smart_routing.Owner.linux, control.state.routing.status().owner);
-    const invalid_source = [_]u8{4, 0, 4, 0, 0x0e, 0};
+    const invalid_source = [_]u8{ 4, 0, 4, 0, 0x0e, 0 };
     try std.testing.expectEqual(@as(isize, invalid_source.len), c.send(sockets[1], &invalid_source, invalid_source.len, 0));
     try std.testing.expectError(error.ProtocolFailure, control.receiveOne());
 }
-
 
 test "external policy never arms the built-in idle release after explicit take" {
     var policy = @import("switching_policy").Policy{ .mode = .external };
@@ -1278,32 +1313,29 @@ test "external policy never arms the built-in idle release after explicit take" 
     try std.testing.expectEqual(@import("switching_policy").Action.none, policy.tick(60_000));
 }
 
-
 test "ownership acknowledgement does not prove local audio source" {
     var state = @import("smart_routing").State{};
     state.updateOwnership(true);
     try std.testing.expectEqual(@import("smart_routing").Owner.unknown, state.source);
-    const local = [_]u8{1,2,3,4,5,6};
-    state.updateAudioSource(.{ .address = .{6,5,4,3,2,1}, .state = .in_call }, local);
+    const local = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    state.updateAudioSource(.{ .address = .{ 6, 5, 4, 3, 2, 1 }, .state = .in_call }, local);
     try std.testing.expectEqual(@import("smart_routing").Owner.remote, state.source);
     try std.testing.expectEqualStrings("call", state.source_kind.kindName());
     state.updateOwnership(true);
     try std.testing.expectEqual(@import("smart_routing").Owner.remote, state.source);
     state.updateAudioSource(.{ .address = local, .state = .playing }, local);
     try std.testing.expectEqual(@import("smart_routing").Owner.linux, state.source);
-    state.updateAudioSource(.{ .address = .{0,0,0,0,0,0}, .state = .idle }, local);
+    state.updateAudioSource(.{ .address = .{ 0, 0, 0, 0, 0, 0 }, .state = .idle }, local);
     try std.testing.expectEqual(@import("smart_routing").Owner.none, state.source);
 }
-
 
 test "bounded explicit peer request only permits yielding" {
     const routing = @import("smart_routing");
     try std.testing.expect(routing.isReleaseRequest("\x04\x00\x04\x00\x11\x00" ++ "xxSetOwnershipToFalsexx"));
     try std.testing.expect(!routing.isReleaseRequest("\x04\x00\x04\x00\x09\x00" ++ "SetOwnershipToFalse"));
     try std.testing.expect(!routing.isReleaseRequest("\x04\x00\x04\x00\x11\x00" ++ "SetOwnershipToTrue"));
-    try std.testing.expect(!routing.isReleaseRequest(&.{4,0,4}));
+    try std.testing.expect(!routing.isReleaseRequest(&.{ 4, 0, 4 }));
 }
-
 
 test "guarded media take accepts media but rejects calls and unknown kinds" {
     var state = smart_routing.State{ .hosts = .local_and_remote, .local_owns = false, .remote_activity = .active, .source = .remote, .source_kind = .playing };
@@ -1314,7 +1346,8 @@ test "guarded media take accepts media but rejects calls and unknown kinds" {
     try std.testing.expect(!state.allowsMediaTake());
     state.source_kind = @enumFromInt(255);
     try std.testing.expect(!state.allowsMediaTake());
-    state.source = .none; state.source_kind = .idle;
+    state.source = .none;
+    state.source_kind = .idle;
     try std.testing.expect(state.allowsMediaTake());
     state.hosts = .unknown;
     try std.testing.expect(!state.allowsMediaTake());
@@ -1327,10 +1360,9 @@ test "media take IPC is typed and cannot request force" {
     const decoded = try ipc.decodeRequest(packet);
     try std.testing.expectEqual(operations.SwitchingAction.take_media, decoded.operation.switching.action);
     try std.testing.expect(!decoded.operation.switching.force);
-    buffer[packet.len-1] = 1;
+    buffer[packet.len - 1] = 1;
     try std.testing.expectError(error.InvalidRequest, ipc.decodeRequest(buffer[0..packet.len]));
 }
-
 
 test "media takeover controller refreshes source and never sends ownership for calls" {
     const media = try runRoutingExchange(&.{ .request = .{ .action = .take_media }, .initial_owner = false, .activity = .playing });
@@ -1340,4 +1372,187 @@ test "media takeover controller refreshes source and never sends ownership for c
     try std.testing.expect(std.mem.indexOf(u8, call.failure.text(), "media takeover denied") != null);
     const unknown = try runRoutingExchange(&.{ .request = .{ .action = .take_media }, .initial_owner = false, .activity = @enumFromInt(255) });
     try std.testing.expect(unknown.result == null);
+}
+
+test "include passive BlueZ selection regression" {
+    @import("std").testing.refAllDecls(@import("bluez"));
+}
+
+test "call recovery IPC is distinct from unrestricted force" {
+    var buffer: [512]u8 = undefined;
+    const request = cli.Command{ .requested_address = null, .backend = .session, .operation = .{ .switching = .{ .action = .take_call } } };
+    const packet = try ipc.encodeRequest(&buffer, request);
+    const decoded = try ipc.decodeRequest(packet);
+    try std.testing.expectEqual(operations.SwitchingAction.take_call, decoded.operation.switching.action);
+    buffer[packet.len - 1] = 1;
+    try std.testing.expectError(error.InvalidRequest, ipc.decodeRequest(buffer[0..packet.len]));
+}
+
+test "local call recovery rejects a remote phone call and unknown source" {
+    const call = try runRoutingExchange(&.{ .request = .{ .action = .take_call }, .initial_owner = false, .activity = .in_call });
+    try std.testing.expect(call.result == null);
+    try std.testing.expect(std.mem.indexOf(u8, call.failure.text(), "call recovery denied") != null);
+    const unknown = try runRoutingExchange(&.{ .request = .{ .action = .take_call }, .initial_owner = false, .activity = @enumFromInt(255) });
+    try std.testing.expect(unknown.result == null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown.failure.text(), "call recovery denied") != null);
+}
+
+test "call reports include native call category and withdraw explicitly" {
+    var buffer: [256]u8 = undefined;
+    const active = smart_routing.callReport(&buffer, .{ 1, 2, 3, 4, 5, 6 }, true);
+    try std.testing.expect(std.mem.indexOf(u8, active, "YES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, active, "01:02:03:04:05:06") != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x31, 0xf5, 0x01 }, active[active.len - 3 ..]);
+    const idle = smart_routing.callReport(&buffer, .{ 1, 2, 3, 4, 5, 6 }, false);
+    try std.testing.expect(std.mem.indexOf(u8, idle, "NO") != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x30, 100 }, idle[idle.len - 2 ..]);
+}
+
+test "routing intents require a live session; only status may establish a cold connection" {
+    for ([_]operations.SwitchingAction{ .take, .take_media, .take_call, .release, .call_start, .call_end }) |action| {
+        const operation = operations.Operation{ .switching = .{ .action = action } };
+        try std.testing.expect(operation.requiresLiveRouting());
+    }
+    const status = operations.Operation{ .switching = .{ .action = .status } };
+    try std.testing.expect(!status.requiresLiveRouting());
+}
+
+test "native peer yield request is a framed OPACK dictionary with explicit true" {
+    var buffer: [256]u8 = undefined;
+    const body = smart_routing.peerYield(&buffer, 301);
+    try std.testing.expectEqual(@as(u8, 0xe5), body[0]);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Hijackv2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "audioRoutingSetOwnershipToFalse" ++ "\x01") != null);
+    const frame = try smart_routing_relay.encode(.send, .{ 6, 5, 4, 3, 2, 1 }, 1, body);
+    try std.testing.expectEqualSlices(u8, body, (try smart_routing_relay.parse(frame.packet())).?.payload);
+}
+
+test "call start asks peer to yield but never fabricates local ownership; end only withdraws" {
+    const start = try runRoutingExchange(&.{ .request = .{ .action = .call_start }, .initial_owner = false, .activity = .playing });
+    try std.testing.expectEqual(smart_routing.Owner.remote, start.result.?.owner);
+    const end = try runRoutingExchange(&.{ .request = .{ .action = .call_end }, .initial_owner = false, .activity = .playing });
+    try std.testing.expectEqual(smart_routing.Owner.remote, end.result.?.owner);
+}
+
+test "call host registration identifies the local host and explicitly marks first contact" {
+    var buffer: [256]u8 = undefined;
+    const body = smart_routing.callRegistration(&buffer, .{ 1, 2, 3, 4, 5, 6 });
+    try std.testing.expectEqual(@as(u8, 0xe5), body[0]);
+    try std.testing.expect(std.mem.indexOf(u8, body, "newTipi" ++ "\x01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "01:02:03:04:05:06") != null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x30, 6 }, body[body.len - 2 ..]);
+}
+
+test "call yield preserves call score and separately represents the peer category" {
+    var buffer: [256]u8 = undefined;
+    const body = smart_routing.peerYield(&buffer, 301);
+    try std.testing.expect(std.mem.indexOf(u8, body, "localscore" ++ "\x31\x2d\x01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "audioRoutingScore" ++ "\x31\xf5\x01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "remotescore" ++ "\x31\xf5\x01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "audioRoutingScore" ++ "\x31\x2d\x01") == null);
+}
+
+test "manual route classification requires a complete framed typed request" {
+    const body = "\xe2\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x4bManualRoute";
+    const frame = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, body);
+    try std.testing.expect(smart_routing.isManualRouteRequest(frame.packet()));
+    for (0..frame.len) |len| try std.testing.expect(!smart_routing.isManualRouteRequest(frame.packet()[0..len]));
+    var false_body = body.*;
+    false_body[2 + "audioRoutingSetOwnershipToFalse".len] = 2;
+    const false_frame = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, &false_body);
+    try std.testing.expect(!smart_routing.isManualRouteRequest(false_frame.packet()));
+    const media = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, "\xe2\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x48Hijackv2");
+    try std.testing.expect(!smart_routing.isManualRouteRequest(media.packet()));
+    const sent = try smart_routing_relay.encode(.send, .{ 1, 2, 3, 4, 5, 6 }, 1, body);
+    try std.testing.expect(!smart_routing.isManualRouteRequest(sent.packet()));
+    const trailing = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, body ++ "\x00");
+    try std.testing.expect(!smart_routing.isManualRouteRequest(trailing.packet()));
+}
+
+test "manual route OPACK supports references and rejects duplicate decision keys" {
+    const ref_body = "\xe3\x49candidate\x4bManualRoute\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\xa1";
+    const referenced = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, ref_body);
+    try std.testing.expect(smart_routing.isManualRouteRequest(referenced.packet()));
+    const duplicate = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, "\xe3\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x4bManualRoute\x46reason\x4bManualRoute");
+    try std.testing.expect(!smart_routing.isManualRouteRequest(duplicate.packet()));
+    const substring = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, "\xe1\x49candidate\x4bManualRoute");
+    try std.testing.expect(!smart_routing.isManualRouteRequest(substring.packet()));
+}
+
+test "automatic peer negotiation receives the existing call score without changing ownership" {
+    var sockets: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_SEQPACKET, 0, &sockets));
+    defer _ = c.close(sockets[0]);
+    defer _ = c.close(sockets[1]);
+    var failure = support.ErrorMessage{};
+    var control = controller.Controller{ .session = try aacp.Session.initialize(sockets[0], transport.nowMs() + 1000, 0, &failure), .advertised_call = true };
+    try std.testing.expect(receiveInitialization(sockets[1]));
+    const body = "\xe3\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x48Hijackv2\x51audioRoutingScore\x31\x2d\x01";
+    const incoming = try smart_routing_relay.encode(.receive, .{ 6, 5, 4, 3, 2, 1 }, 1, body);
+    try std.testing.expect(smart_routing.automaticRequest(incoming.packet()) != null);
+    try std.testing.expectEqual(@as(isize, @intCast(incoming.len)), c.send(sockets[1], incoming.packet().ptr, incoming.len, 0));
+    const event = (try control.receiveOne()).?;
+    try std.testing.expect(event == .release_requested);
+    const expected = try smart_routing_relay.encode(.send, .{ 6, 5, 4, 3, 2, 1 }, 1, "\xe1\x51audioRoutingScore\x31\xf5\x01");
+    try std.testing.expect(receiveExpected(sockets[1], expected.packet()));
+    try std.testing.expectEqual(smart_routing.Owner.unknown, control.state.routing.status().owner);
+    const manual = try smart_routing_relay.encode(.receive, .{ 6, 5, 4, 3, 2, 1 }, 1, "\xe2\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x4bManualRoute");
+    try std.testing.expectEqual(@as(isize, @intCast(manual.len)), c.send(sockets[1], manual.packet().ptr, manual.len, 0));
+    try std.testing.expect((try control.receiveOne()).? == .manual_route_requested);
+    try std.testing.expect(!control.advertised_call);
+    try std.testing.expectEqual(@as(isize, @intCast(incoming.len)), c.send(sockets[1], incoming.packet().ptr, incoming.len, 0));
+    _ = try control.receiveOne();
+    var extra: [512]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, -1), c.recv(sockets[1], &extra, extra.len, c.MSG_DONTWAIT));
+}
+
+test "score response classification rejects a manual route and missing score" {
+    const manual = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, "\xe2\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x4bManualRoute");
+    try std.testing.expect(smart_routing.automaticRequest(manual.packet()) == null);
+    const absent = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, "\xe2\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x48Hijackv2");
+    try std.testing.expect(smart_routing.automaticRequest(absent.packet()) == null);
+}
+
+test "RoutedToBluetooth is an automatic routing request; manual reasons stay distinct" {
+    const routed = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, "\xe2\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x51RoutedToBluetooth");
+    try std.testing.expect(smart_routing.automaticRequest(routed.packet()) != null);
+    try std.testing.expect(!smart_routing.isManualRouteRequest(routed.packet()));
+    const reverse = try smart_routing_relay.encode(.receive, .{ 1, 2, 3, 4, 5, 6 }, 1, "\xe2\x5faudioRoutingSetOwnershipToFalse\x01\x46reason\x53ReverseBannerTapped");
+    try std.testing.expect(smart_routing.automaticRequest(reverse.packet()) == null);
+    try std.testing.expect(smart_routing.isManualRouteRequest(reverse.packet()));
+}
+
+test "call score announcement has a native score only and withdraws to idle" {
+    var buffer: [256]u8 = undefined;
+    const active = smart_routing.callScoreAnnouncement(&buffer, true);
+    try std.testing.expectEqual(@as(u8, 0xe1), active[0]);
+    try std.testing.expect(std.mem.indexOf(u8, active, "audioRoutingScore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, active, "Ownership") == null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x31, 0xf5, 0x01 }, active[active.len - 3 ..]);
+    const idle = smart_routing.callScoreAnnouncement(&buffer, false);
+    try std.testing.expectEqualSlices(u8, &.{ 0x30, 100 }, idle[idle.len - 2 ..]);
+}
+
+test "score lifecycle announcements are deduplicated and withdrawn without ownership writes" {
+    const start = try runRoutingExchange(&.{ .request = .{ .action = .call_start }, .initial_owner = true, .activity = .idle, .source_is_local = true });
+    try std.testing.expectEqual(true, start.announced_score);
+    try std.testing.expectEqual(smart_routing.Owner.linux, start.result.?.owner);
+    const repeat = try runRoutingExchange(&.{ .request = .{ .action = .call_start }, .initial_owner = true, .activity = .idle, .source_is_local = true, .previous_score = true });
+    try std.testing.expectEqual(true, repeat.announced_score);
+    const end = try runRoutingExchange(&.{ .request = .{ .action = .call_end }, .initial_owner = false, .activity = .playing, .previous_score = true });
+    try std.testing.expectEqual(false, end.announced_score);
+    try std.testing.expectEqual(smart_routing.Owner.remote, end.result.?.owner);
+    const repeat_end = try runRoutingExchange(&.{ .request = .{ .action = .call_end }, .initial_owner = false, .activity = .playing, .previous_score = false });
+    try std.testing.expectEqual(false, repeat_end.announced_score);
+}
+
+test "manual choice during fresh routing cancels queued claims and call announcements" {
+    for ([_]operations.SwitchingAction{ .take, .take_media, .take_call, .call_start }) |action| {
+        const result = try runRoutingExchange(&.{ .request = .{ .action = action }, .initial_owner = false, .activity = .playing, .manual_during_refresh = true });
+        try std.testing.expect(result.result == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.failure.text(), "manual route selected") != null);
+        try std.testing.expect(result.announced_score == null);
+    }
+    const status = try runRoutingExchange(&.{ .request = .{ .action = .status }, .initial_owner = false, .activity = .playing, .manual_during_refresh = true });
+    try std.testing.expectEqual(smart_routing.Owner.remote, status.result.?.owner);
 }

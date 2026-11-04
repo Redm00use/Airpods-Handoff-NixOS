@@ -9,6 +9,9 @@ in {
     device = mkOption { type = types.strMatching "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"; description = "Already paired AirPods Bluetooth address."; example = "AA:BB:CC:DD:EE:FF"; };
     package = mkOption { type = types.package; default = pkgs.callPackage ./package.nix {}; description = "Handoff package, including its matching AACP controller."; };
     spoofAppleDeviceId = mkOption { type = types.bool; default = false; description = "Advertise an Apple Bluetooth DeviceID to enable experimental multipoint. Applies to the adapter, not just this pair."; };
+    keepCallTransport = mkOption { type = types.bool; default = false; description = "Keep an already-owned PC call audio transport clocked with zero PCM while muted/silent; no microphone recording."; };
+    autoConnect = mkOption { type = types.bool; default = true; description = "Open the paired AACP control channel in the background, without connecting an audio profile or requesting ownership. Unavailable devices use bounded exponential backoff."; };
+    preferIdlePC = mkOption { type = types.bool; default = true; description = "Select Linux when both hosts are confirmed idle; never infer phone idleness from missing state."; };
     shadow = mkOption { type = types.bool; default = false; description = "Observe and log decisions without ownership, pause or audio commands."; };
   };
   config = mkIf cfg.enable {
@@ -20,6 +23,12 @@ in {
       enable = mkDefault true;
       pulse.enable = mkDefault true;
       wireplumber.enable = mkDefault true;
+      wireplumber.extraConfig."90-airpods-handoff"."monitor.bluez.rules" = [
+        {
+          matches = [ { "device.name" = "bluez_card.${lib.replaceStrings [ ":" ] [ "_" ] (lib.toUpper cfg.device)}"; } ];
+          actions.update-props."bluez5.auto-connect" = [ ];
+        }
+      ];
     };
     security.rtkit.enable = mkDefault true;
     environment.systemPackages = [ cfg.package cfg.package.controller ];
@@ -44,7 +53,12 @@ in {
       wants = [ "wireplumber.service" ];
       partOf = [ "graphical-session.target" ];
       unitConfig.ConditionUser = cfg.user;
-      environment.AIRPODS_DEVICE = lib.toUpper cfg.device;
+      environment = {
+        AIRPODS_DEVICE = lib.toUpper cfg.device;
+        AIRPODS_CALL_AUDIO_GUARD = if cfg.keepCallTransport then "1" else "0";
+        AIRPODS_AUTO_CONNECT = if cfg.autoConnect then "1" else "0";
+        AIRPODS_PREFER_IDLE_PC = if cfg.preferIdlePC then "1" else "0";
+      };
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/airpods-handoff${lib.optionalString cfg.shadow " --shadow"}";
         Restart = "on-failure";

@@ -69,6 +69,8 @@ pub const Address = struct {
 
 const Device = struct {
     connected: bool = false,
+    paired: bool = false,
+    blocked: bool = false,
     has_device_interface: bool = false,
     address: [17]u8 = undefined,
     address_len: usize = 0,
@@ -80,6 +82,13 @@ const Device = struct {
     modalias_len: usize = 0,
     object_path: [max_object_path]u8 = undefined,
     object_path_len: usize = 0,
+
+    fn isPairedAirPods(self: *const Device) bool {
+        if (!self.paired or self.blocked) return false;
+        var candidate = self.*;
+        candidate.connected = true;
+        return candidate.isAirPods();
+    }
 
     fn isAirPods(self: *const Device) bool {
         // BlueZ may omit Modalias, so names are the fallback unless a non-Apple vendor is explicit.
@@ -175,6 +184,12 @@ fn readPropertyVariant(
         var connected: c_int = 0;
         result = c.sd_bus_message_read(message, "b", &connected);
         if (result >= 0) device.connected = connected != 0;
+    } else if ((std.mem.eql(u8, property, "Paired") or std.mem.eql(u8, property, "Blocked")) and std.mem.eql(u8, std.mem.span(contents), "b")) {
+        var value: c_int = 0;
+        result = c.sd_bus_message_read(message, "b", &value);
+        if (result >= 0) {
+            if (std.mem.eql(u8, property, "Paired")) device.paired = value != 0 else device.blocked = value != 0;
+        }
     } else if ((std.mem.eql(u8, property, "Address") or
         std.mem.eql(u8, property, "Alias") or
         std.mem.eql(u8, property, "Name") or
@@ -298,8 +313,9 @@ fn readDeviceInterfaces(
     }
 }
 
-fn selectDevice(
+fn selectDeviceMode(
     devices: []const Device,
+    allow_paired: bool,
     requested_address: ?[]const u8,
     failure: *support.ErrorMessage,
 ) Error!Address {
@@ -312,7 +328,7 @@ fn selectDevice(
     var match_count: usize = 0;
 
     for (devices) |device| {
-        if (!device.isAirPods()) continue;
+        if (!device.isAirPods() and !(allow_paired and requested != null and device.isPairedAirPods())) continue;
         var address = Address.parse(device.address[0..device.address_len]) orelse {
             failure.set("invalid Bluetooth address returned by BlueZ: {s}", .{device.address[0..device.address_len]});
             return error.BluezFailure;
@@ -342,6 +358,16 @@ fn selectDevice(
 
 // Query only BlueZ's already-managed devices; discovery never scans or pairs hardware.
 pub fn discover(requested_address: ?[]const u8, failure: *support.ErrorMessage) Error!Address {
+    return discoverMode(requested_address, false, failure);
+}
+
+// External policy may open only the control PSM of an explicitly selected,
+// already-paired device. Never connect audio profiles merely to inspect state.
+pub fn discoverPairedControl(requested_address: ?[]const u8, failure: *support.ErrorMessage) Error!Address {
+    return discoverMode(requested_address, true, failure);
+}
+
+fn discoverMode(requested_address: ?[]const u8, allow_paired: bool, failure: *support.ErrorMessage) Error!Address {
     // Bound retained device data while the D-Bus reply itself may contain many unrelated objects.
     var devices: [max_devices]Device = undefined;
     var device_count: usize = 0;
@@ -369,7 +395,7 @@ pub fn discover(requested_address: ?[]const u8, failure: *support.ErrorMessage) 
             failure.setSystem("cannot leave BlueZ object", -result);
             return error.BluezFailure;
         }
-        if (device.isAirPods()) {
+        if (device.isAirPods() or (allow_paired and requested_address != null and device.isPairedAirPods())) {
             if (device_count == devices.len) {
                 failure.set("too many connected AirPods to inspect safely", .{});
                 return error.BluezFailure;
@@ -382,7 +408,7 @@ pub fn discover(requested_address: ?[]const u8, failure: *support.ErrorMessage) 
         failure.setSystem("cannot iterate BlueZ objects", -result);
         return error.BluezFailure;
     }
-    return selectDevice(devices[0..device_count], requested_address, failure);
+    return selectDeviceMode(devices[0..device_count], allow_paired, requested_address, failure);
 }
 
 const MediaTransport = struct {
@@ -790,6 +816,14 @@ pub fn openControlChannel(
     }
     errdefer _ = c.close(fd);
 
+    // AACP is a paired BR/EDR control channel. Request authentication/encryption
+    // explicitly instead of relying on a preceding BlueZ audio connection.
+    var security = c.struct_bt_security{ .level = c.BT_SECURITY_MEDIUM, .key_size = 0 };
+    if (c.setsockopt(fd, c.SOL_BLUETOOTH, c.BT_SECURITY, &security, @sizeOf(c.struct_bt_security)) != 0) {
+        failure.setSystem("cannot configure authenticated AirPods control channel", support.lastErrno());
+        return error.TransportFailure;
+    }
+
     // Zig represents glibc's transparent sockaddr parameter as an explicit union field.
     if (c.connect(
         fd,
@@ -805,4 +839,22 @@ pub fn openControlChannel(
     }
     try waitForConnection(fd, deadline_ms, failure);
     return fd;
+}
+
+
+test "passive control requires explicit paired unblocked AirPods" {
+    var failure = support.ErrorMessage{};
+    var device = Device{ .has_device_interface = true, .paired = true };
+    copyProperty(&device.address, &device.address_len, "AA:BB:CC:DD:EE:FF");
+    copyProperty(&device.name, &device.name_len, "AirPods Pro");
+    const address = try selectDeviceMode(&.{device}, true, "AA:BB:CC:DD:EE:FF", &failure);
+    try std.testing.expectEqualStrings("AA:BB:CC:DD:EE:FF", &address.text);
+    try std.testing.expectError(error.BluezFailure, selectDeviceMode(&.{device}, false, "AA:BB:CC:DD:EE:FF", &failure));
+    try std.testing.expectError(error.BluezFailure, selectDeviceMode(&.{device}, true, null, &failure));
+    try std.testing.expectError(error.BluezFailure, selectDeviceMode(&.{device}, true, "00:11:22:33:44:55", &failure));
+    device.blocked = true;
+    try std.testing.expectError(error.BluezFailure, selectDeviceMode(&.{device}, true, "AA:BB:CC:DD:EE:FF", &failure));
+    device.blocked = false;
+    device.paired = false;
+    try std.testing.expectError(error.BluezFailure, selectDeviceMode(&.{device}, true, "AA:BB:CC:DD:EE:FF", &failure));
 }

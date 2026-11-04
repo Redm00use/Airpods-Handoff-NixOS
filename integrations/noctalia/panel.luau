@@ -1,5 +1,6 @@
 local state = {available=false,title="AirPods Handoff",detail="Подключаюсь к обработчику…"}
 local streaming = false
+local modes = {call="Разговор",music="Музыка",video="Видео",game="Игра",mixed="Несколько медиапотоков",media="Медиа",idle="Нет активного звука"}
 local busy = false
 local actionError = nil
 
@@ -13,11 +14,13 @@ local function render()
   panel.render(ui.scroll({gap=12,padding=12},{
     ui.row({gap=10,align="center"},{ui.glyph({name="device-airpods",size=25}),ui.label({text="AirPods Handoff",fontSize=20,fontWeight="bold"})}),
     ui.label({text=state.title or "Состояние недоступно",fontSize=16,fontWeight="bold",maxLines=2}),
+    ui.label({text="Режим ПК: "..(modes[state.local_mode] or "Уточняется"),fontSize=13,color="secondaryText"}),
     ui.label({text=actionError or state.detail or "",fontSize=13,color="secondaryText",maxLines=3}),
     ui.row({gap=8},{
       ui.button({text="Авто",selected=state.available and not state.pinned,enabled=state.available and not busy,onClick=function() control("auto") end}),
       ui.button({text=state.pinned and "Закреплено за ПК" or "Закрепить за ПК",glyph="pin",selected=state.pinned==true,enabled=state.available and not busy,tooltip="Не отдавать приоритет автоматически, даже на паузе. Самостоятельное переключение AirPods остаётся возможным.",onClick=function() control(state.pinned and "auto" or "pin") end})
     }),
+    ui.button({text=state.connecting and "Подключение…" or (state.bluetooth_connected and "Отключить" or "Подключить"),enabled=state.available and not busy and not state.connecting and (state.bluetooth_connected or state.can_connect==true),onClick=function() control(state.bluetooth_connected and "disconnect" or "connect") end}),
     ui.button({text=state.conflict and "Повторить возврат на ПК" or "Вернуть звук на ПК",glyph="arrow-back-up",enabled=state.can_return==true and not busy and not state.pending,onClick=function() control("return") end})
   }))
 end

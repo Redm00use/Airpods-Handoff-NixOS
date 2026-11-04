@@ -11,7 +11,7 @@ pub const usage =
     \\       airpodsctl [-v] [--device MAC] battery [COMPONENT]
     \\       airpodsctl [-v] [--device MAC] wear-status
     \\       airpodsctl [-v] [--device MAC] switching status|release
-    \\       airpodsctl [-v] [--device MAC] switching take [--force] | take-media
+    \\       airpodsctl [-v] [--device MAC] switching take [--force] | take-media | take-call
     \\       airpodsctl [-v] [--device MAC] serve [--pause-on-removal=POLICY] [--auto-switch=MODE]
     \\
     \\Commands:
@@ -275,6 +275,12 @@ pub fn parseInvocation(arguments: []const [:0]const u8) Invocation {
             .take
         else if (std.mem.eql(u8, positional[1], "take-media"))
             .take_media
+        else if (std.mem.eql(u8, positional[1], "take-call"))
+            .take_call
+        else if (std.mem.eql(u8, positional[1], "call-start"))
+            .call_start
+        else if (std.mem.eql(u8, positional[1], "call-end"))
+            .call_end
         else if (std.mem.eql(u8, positional[1], "release"))
             .release
         else

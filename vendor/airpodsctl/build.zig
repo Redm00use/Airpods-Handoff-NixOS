@@ -224,6 +224,9 @@ pub fn build(builder: *std.Build) void {
         .optimize = optimize,
     });
     test_module.addImport("aacp", aacp_module);
+    test_module.addImport("bluez", bluez_module);
+    test_module.linkSystemLibrary("bluetooth", .{});
+    test_module.linkSystemLibrary("libsystemd", .{});
     test_module.addImport("battery", battery_module);
     test_module.addImport("bluez_media", bluez_media_module);
     test_module.addImport("cli", cli_module);

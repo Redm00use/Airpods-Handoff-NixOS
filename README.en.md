@@ -72,3 +72,54 @@ Hardware update: Cider-over-iPhone and a Discord call recovery were hearing-conf
 The optional [Noctalia 5.2 / Luau API 24 panel](integrations/noctalia/README.md) displays source/call/recovery/conflict and exposes the same controls. It does not depend on personal scripts or addresses. Status strings are currently Russian.
 
 Recovery now reacts immediately to a known sink error and repairs late-arriving graph edges within the same attempt. The extra 300ms restore delay was removed only for a proven local session and typed remote media. An initial optimized sample showed 264ms from ownership ACK to observed graph readiness; the user initially perceived little difference. The latest policy change is not an acoustic latency guarantee.
+
+## Background connection update (2026-11-01, hardware validation pending)
+
+`autoConnect` and `preferIdlePC` default to true. Background connection opens
+only the AACP L2CAP channel of the explicitly selected, paired device. It never
+calls ConnectProfile or takes ownership. The module disables WirePlumber's
+independent bluez5.auto-connect for this device. A2DP is opened on demand after
+local ownership and a protected local session. Retries back off 5/15/30/60s;
+key errors stop retries. Pairing is never removed. Manual Disconnect pauses
+background reconnect until Connect or service restart.
+
+Confirmed idle on both hosts selects Linux using non-forced take after 1 second.
+Unknown source/activity never counts as idle. Disable with `autoConnect = false;
+preferIdlePC = false;`. The initial background-A2DP implementation failed hardware
+validation by pausing iPhone music; the control-only replacement preserved iPhone music in one hardware test. Idle-PC selection was also confirmed. Repeated transitions, calls and sleep still need broader validation.
+
+## Continuing PC calls
+
+A previously proven local call may reacquire ownership across AACP reconnection,
+including a typed phone-call source, using a separate fresh-source-checked
+`take-call` request. Unknown is rejected; three recovery attempts per continuous
+call, then explicit conflict/manual return. Hangup cancels queued work and suspend
+clears the lease. A fresh/baseline PC call does not automatically interrupt an
+already-owned iPhone call. Browser duplex matching is a heuristic, not a universal
+call-lifecycle API. Hardware verification of this update is separate from tests.
+
+## Hardware follow-up (2026-11-02)
+
+The zero-PCM call guard did not reliably prevent iPhone takeovers and defaults
+to off. Control-only reconnection preserved iPhone music in a hearing-confirmed
+test; paging initially failed twice. Cold connection now has a separate 10s
+budget, operations receive a fresh 3s budget, and routing mutations require a
+live control session. The paired L2CAP socket explicitly requests medium security.
+
+Call category reports, peer yield messages and first-contact host announcements
+are implemented. The generic media-scored yield request still failed a quiet
+Discord test after three recoveries. A control-channel-only trace showed call
+category 501 followed by media routing score 301. A version using consistent
+call scores (501) is being validated; it is a protocol hypothesis, not a claim
+of macOS parity. No unlimited takeover loop is enabled.
+
+## Explicit phone selection
+
+The user confirmed that the failing takeover tests included manually selecting
+AirPods on the iPhone; the trace contained `ManualRoute`. These tests must not
+be described as proof of a purely automatic-switching failure. The selected
+policy now lets explicit phone choice override an ongoing PC call or media
+lease, matching the intended Apple-like behavior. A bounded OPACK reader requires
+a typed true yield request and an exact manual reason. It invalidates pending
+returns and withdraws the PC call report without ending the call. A new explicit
+PC return/play/call can reselect the PC. Hardware validation is pending.

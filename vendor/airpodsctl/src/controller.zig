@@ -1,3 +1,4 @@
+const std = @import("std");
 const aacp = @import("aacp");
 const battery = @import("battery");
 const command = @import("command");
@@ -31,6 +32,7 @@ pub const Event = union(enum) {
     routing: smart_routing.Status,
     routing_relay: smart_routing.Relay,
     release_requested: void,
+    manual_route_requested: void,
 };
 
 fn ignoreEvent(_: ?*anyopaque, _: Event) void {}
@@ -78,6 +80,7 @@ fn loggedEvent(event: Event) Event {
                 status.remote_activity.name(),
             },
         ),
+        .manual_route_requested => support.log(.info, "Received an explicit manual route selection from the paired peer.", .{}),
         .release_requested => support.log(.info, "Received an explicit request to yield audio ownership from the AirPods routing channel.", .{}),
         .routing_relay => |message| support.log(
             .debug,
@@ -91,12 +94,28 @@ fn loggedEvent(event: Event) Event {
 pub const Controller = struct {
     session: aacp.Session,
     local_address: ?smart_routing.Address = null,
+    announced_call_peer: ?smart_routing.Address = null,
+    advertised_call: bool = false,
+    announced_call_score: ?bool = null,
+    manual_route_revision: u64 = 0,
     state: State = .{},
 
     pub fn receiveOne(self: *Controller) Error!?Event {
         const packet = try self.session.receive();
-        support.log(.debug, "AACP frame length={d}, opcode={x}", .{packet.len, if (packet.len >= 6) @as(u16, packet[4]) | (@as(u16, packet[5]) << 8) else @as(u16, 0xffff)});
+        support.log(.debug, "AACP frame length={d}, opcode={x}", .{ packet.len, if (packet.len >= 6) @as(u16, packet[4]) | (@as(u16, packet[5]) << 8) else @as(u16, 0xffff) });
 
+        if (smart_routing.isManualRouteRequest(packet)) {
+            self.manual_route_revision +%= 1;
+            self.advertised_call = false;
+            return loggedEvent(.{ .manual_route_requested = {} });
+        }
+        if (self.advertised_call) {
+            if (smart_routing.automaticRequest(packet)) |message| {
+                var payload: [256]u8 = undefined;
+                smart_routing.sendRelay(&self.session, message.address, 1, smart_routing.callScoreReply(&payload)) catch return error.ProtocolFailure;
+                support.log(.info, "Answered automatic peer routing negotiation with the existing PC call score 501; no ownership change requested.", .{});
+            }
+        }
         if (smart_routing.isReleaseRequest(packet)) return loggedEvent(.{ .release_requested = {} });
         if (control_command.parsePacket(packet) catch {
             self.session.channel.failure.set("AirPods returned an invalid control-command response", .{});
@@ -194,15 +213,63 @@ pub const Controller = struct {
         return self.state.routing.status();
     }
 
+    fn reportCall(self: *Controller, active: bool) Error!void {
+        if (!active) self.advertised_call = false;
+        const local = self.local_address orelse return error.PolicyDenied;
+        var peer = self.state.routing.peer_address orelse return error.PolicyDenied;
+        std.mem.reverse(u8, &peer);
+        var payload: [256]u8 = undefined;
+        if (active and (self.announced_call_peer == null or !std.mem.eql(u8, &self.announced_call_peer.?, &peer))) {
+            smart_routing.sendRelay(&self.session, peer, 1, smart_routing.callRegistration(&payload, local)) catch return error.ProtocolFailure;
+            self.announced_call_peer = peer;
+            support.log(.info, "Announced the paired PC host to its call peer for this control session.", .{});
+        }
+        smart_routing.sendRelay(&self.session, peer, 1, smart_routing.callReport(&payload, local, active)) catch return error.ProtocolFailure;
+        if (self.announced_call_score == null or self.announced_call_score.? != active) {
+            smart_routing.sendRelay(&self.session, peer, 1, smart_routing.callScoreAnnouncement(&payload, active)) catch return error.ProtocolFailure;
+            self.announced_call_score = active;
+            support.log(.info, "Announced PC routing score {d} for a call lifecycle change; no ownership change requested.", .{@as(u16, if (active) 501 else 100)});
+        }
+        self.advertised_call = active;
+        if (active) {
+            const peer_category: u16 = if (self.state.routing.source == .remote)
+                switch (self.state.routing.source_kind) {
+                    .in_call => 501,
+                    .playing => 301,
+                    else => 100,
+                }
+            else
+                100;
+            smart_routing.sendRelay(&self.session, peer, 1, smart_routing.peerYield(&payload, peer_category)) catch return error.ProtocolFailure;
+            support.log(.info, "Sent the proven PC call report and a native peer yield request; peer acceptance is unconfirmed.", .{});
+        }
+    }
+
     fn runSwitching(
         self: *Controller,
         request: command.Switching,
         observer: EventObserver,
     ) Error!command.Result {
+        const manual_revision = self.manual_route_revision;
         var status = try self.refreshRouting(observer);
+        if (manual_revision != self.manual_route_revision) {
+            switch (request.action) {
+                .take, .take_media, .take_call, .call_start => {
+                    self.session.channel.failure.set("manual route selected during refresh; queued routing action cancelled", .{});
+                    return error.PolicyDenied;
+                },
+                .status, .release, .call_end => {},
+            }
+        }
         switch (request.action) {
             .status => return .{ .switching = status },
-            .take, .take_media => {
+            .call_start, .call_end => {
+                if (status.hosts != .local_and_remote) return error.PolicyDenied;
+                try self.reportCall(request.action == .call_start);
+                // This acknowledges sending only; it never confirms peer acceptance or ownership.
+                return .{ .switching = status };
+            },
+            .take, .take_media, .take_call => {
                 if (status.hosts != .local_and_remote) {
                     self.session.channel.failure.set(
                         "AirPods multipoint is not ready; connect the iPhone and verify the BlueZ DeviceID setup",
@@ -214,9 +281,14 @@ pub const Controller = struct {
                     self.session.channel.failure.set("media takeover denied: fresh source is a call, unknown, or multipoint unavailable", .{});
                     return error.PolicyDenied;
                 }
+                if (request.action == .take_call and !self.state.routing.allowsCallTake()) {
+                    self.session.channel.failure.set("call recovery denied: fresh source is a remote call, unknown, or multipoint unavailable", .{});
+                    return error.PolicyDenied;
+                }
+                if (request.action == .take_call) try self.reportCall(true);
                 if (self.state.routing.confirmed_owns == true) return .{ .switching = status };
                 if (request.force and status.owner == .linux) return .{ .switching = status };
-                if (!request.force and request.action != .take_media and (status.owner == .unknown or status.remote_activity != .idle)) {
+                if (!request.force and request.action != .take_media and request.action != .take_call and (status.owner == .unknown or status.remote_activity != .idle)) {
                     self.session.channel.failure.set(
                         "remote AirPods activity is not confirmed idle; use switching take --force to override it",
                         .{},
@@ -238,7 +310,7 @@ pub const Controller = struct {
             },
         }
 
-        const target_owns = request.action == .take or request.action == .take_media;
+        const target_owns = request.action == .take or request.action == .take_media or request.action == .take_call;
         const previous_generation = self.state.ownership_generation;
         try smart_routing.setOwnership(&self.session, target_owns);
 

@@ -35,6 +35,19 @@
         in {
           unit = self.packages.${system}.default;
           protocol = self.packages.${system}.airpodsctl;
+          bluez-selection = pkgs.runCommand "airpods-paired-control-selection-check" {
+            nativeBuildInputs = [ pkgs.zig_0_16 pkgs.pkg-config ];
+            buildInputs = [ pkgs.bluez pkgs.systemd ];
+          } ''
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+            zig test -OReleaseSafe -lc $(pkg-config --cflags --libs bluez libsystemd) \
+              --dep bluez_media --dep support --dep transport -Mroot=${./vendor/airpodsctl}/src/bluez.zig \
+              -Mbluez_media=${./vendor/airpodsctl}/src/bluez_media.zig \
+              -Msupport=${./vendor/airpodsctl}/src/support.zig \
+              --dep support -Mtransport=${./vendor/airpodsctl}/src/transport.zig \
+              --cache-dir "$TMPDIR/zig-cache"
+            touch "$out"
+          '';
           cli = pkgs.runCommand "airpods-handoff-cli-check" {} ''
             ${self.packages.${system}.default}/bin/airpods-handoff --help > /dev/null
             ${self.packages.${system}.default}/bin/airpods-handoffctl --help > /dev/null

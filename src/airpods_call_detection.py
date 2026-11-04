@@ -1,10 +1,11 @@
 """Recognize duplex communications without assuming applications set media.role."""
 from dataclasses import dataclass, field
+from airpods_voice_transport import VoiceTransport
 
 def app_family(props):
     binary=str(props.get('application.process.binary','')).lower()
     name=str(props.get('application.name','')).lower()
-    for key in ('discord','telegram','zoom','teams','signal','jami','element'):
+    for key in ('discord','telegram','zoom','teams','signal','jami','element','slack','webex','jitsi','linphone','whatsapp','viber'):
         if key in binary or key in name:return key
     return ''
 
@@ -16,18 +17,24 @@ def call_sessions(objects):
         cls=p.get('media.class','')
         if cls not in ('Stream/Input/Audio','Stream/Output/Audio'):continue
         if info.get('state') not in ('running','idle','error'):continue
-        merged=dict(clients.get(p.get('client.id'),{}));merged.update(p)
+        client_id=p.get('client.id')
+        if isinstance(client_id,str) and client_id.isdecimal():client_id=int(client_id)
+        merged=dict(clients.get(client_id,{}));merged.update(p)
         role=str(merged.get('media.role','')).lower();name=str(merged.get('node.name','')).lower()
         app=app_family(merged)
+        binary=str(merged.get('application.process.binary','')).lower()
+        app_name=str(merged.get('application.name','')).lower()
+        browser=(binary in ('zen','zen-beta','zen-bin') or app_name in ('zen','zen browser','zen browser beta') or any(x in binary or x in app_name for x in ('firefox','chromium','chrome','brave','vivaldi','opera','microsoft-edge')))
         # Spectrum, monitor and notification streams never establish a call lease.
         target=str(merged.get('target.object','')).lower()
         if role in ('notification','event','music','movie','video','game','dsp','filter'):continue
         if 'spectrum' in str(merged.get('application.name','')).lower():continue
         if str(merged.get('stream.capture.sink','')).lower() in ('true','1') or (cls=='Stream/Input/Audio' and ('bluez_output.' in target or target.endswith('.monitor') or target=='easyeffects_sink')):continue
-        if not (app or role=='communication' or 'webrtc voiceengine' in name):continue
+        if not (app or browser or role=='communication' or 'webrtc voiceengine' in name):continue
         pid=merged.get('application.process.id')
-        identity=(app or str(merged.get('application.process.binary','unknown')),str(pid if pid is not None else p.get('client.id',key)))
-        group=groups.setdefault(identity,{'input':False,'output':False,'running':False,'app':app or 'communication','explicit':False})
+        # Never join capture and playback from unrelated browser processes.
+        identity=(app or ('browser' if browser else str(merged.get('application.process.binary','unknown'))),str(pid if pid is not None else p.get('client.id',key)))
+        group=groups.setdefault(identity,{'input':False,'output':False,'running':False,'app':app or ('browser-duplex' if browser else 'communication'),'explicit':False})
         group['input' if cls=='Stream/Input/Audio' else 'output']=True
         group['running'] |= info.get('state')=='running'
         group['explicit'] |= role=='communication'
@@ -36,6 +43,7 @@ def call_sessions(objects):
 @dataclass
 class CallTracker:
     active: bool = False
+    voice_transport: VoiceTransport = field(default_factory=VoiceTransport)
     candidates: dict = field(default_factory=dict)
     onset: float | None = None
     expiry: float | None = None
@@ -43,6 +51,7 @@ class CallTracker:
 
     def observe(self,now,objects):
         self.candidates=call_sessions(objects)
+        self.candidates.update(self.voice_transport.observe(now,objects,self.candidates,self.active))
         present=bool(self.candidates) and (self.active or any(x['running'] for x in self.candidates.values()))
         if present:
             self.expiry=None
@@ -57,10 +66,13 @@ class CallTracker:
         if self.onset is not None and now>=self.onset+.2:self.active=True
         if self.expiry is not None and now>=self.expiry:
             self.active=False;self.expiry=None;self.evidence=()
+            self.voice_transport.reset()
         return self.active
 
     def deadline(self,now):
         values=[]
+        voice_deadline=self.voice_transport.deadline(now)
+        if self.active and voice_deadline is not None:values.append(voice_deadline)
         if not self.active and self.onset is not None:values.append(self.onset+.2)
         if self.expiry is not None:values.append(self.expiry)
         return min((x for x in values if x>now),default=None)

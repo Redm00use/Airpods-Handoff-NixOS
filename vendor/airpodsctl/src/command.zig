@@ -21,6 +21,9 @@ pub const SwitchingAction = enum {
     status,
     take,
     take_media,
+    take_call,
+    call_start,
+    call_end,
     release,
 };
 
@@ -34,6 +37,13 @@ pub const Operation = union(enum) {
     battery: ?battery.Component,
     wear_status,
     switching: Switching,
+
+    pub fn requiresLiveRouting(self: Operation) bool {
+        return switch (self) {
+            .switching => |request| request.action != .status,
+            else => false,
+        };
+    }
 
     pub fn name(self: Operation) []const u8 {
         return switch (self) {
@@ -51,6 +61,9 @@ pub const Operation = union(enum) {
                 .status => "switching-status",
                 .take => "switching-take",
                 .take_media => "switching-take-media",
+                .take_call => "switching-take-call",
+                .call_start => "switching-call-start",
+                .call_end => "switching-call-end",
                 .release => "switching-release",
             },
         };

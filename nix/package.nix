@@ -55,7 +55,8 @@ in stdenvNoCC.mkDerivation {
       --set AIRPODS_CTL ${controller}/bin/airpodsctl \
       --set AIRPODS_PACTL ${pulseaudio}/bin/pactl \
       --set AIRPODS_PW_LINK ${pipewire}/bin/pw-link \
-      --set AIRPODS_PW_DUMP ${pipewire}/bin/pw-dump
+      --set AIRPODS_PW_DUMP ${pipewire}/bin/pw-dump \
+      --set AIRPODS_PW_CAT ${pipewire}/bin/pw-cat
     makeWrapper ${python}/bin/python3 "$out/bin/airpods-handoff-diagnose" \
       --add-flags "$out/lib/airpods-handoff/diagnose.py" \
       --prefix PATH : ${lib.makeBinPath [ systemd wireplumber pipewire ]}

@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Event adapters for the existing airpodsctl controller; no Bluetooth Connect/Disconnect."""
-import time, re
+"""Event-driven ownership, independent background connection and bounded repair."""
+import time
 import asyncio, json, os, socket, struct, logging, argparse, signal, fcntl, codecs, shutil
 from pathlib import Path
 from dbus_next import Message, MessageType, BusType
 from dbus_next.aio import MessageBus
 from airpods_handoff_policy import Policy
 from airpods_call_detection import CallTracker, app_family
-from airpods_audio_sessions import PlaybackTracker, candidates, stream_props, muted
+from airpods_audio_sessions import PlaybackTracker, candidates, stream_props, muted, media_mode
 from airpods_handoff_control import ControlServer
+from airpods_connection import ManualConnection
+from airpods_call_audio import CallAudioGuard
 
 MAC=os.environ.get('AIRPODS_DEVICE','').upper().replace(':','_')
-CTL=os.environ.get('AIRPODS_CTL',shutil.which('airpodsctl') or 'airpodsctl')
-PACTL=os.environ.get('AIRPODS_PACTL',shutil.which('pactl') or 'pactl')
-PW_LINK=os.environ.get('AIRPODS_PW_LINK',shutil.which('pw-link') or 'pw-link')
+CTL=os.environ.get('AIRPODS_CTL',str(Path.home()/'.local/share/airpodsctl-relay-fix/bin/airpodsctl'))
+PACTL=os.environ.get('AIRPODS_PACTL',shutil.which('pactl') or str(Path.home()/'.local/share/pulseaudio-tools/bin/pactl'))
+PW_LINK=os.environ.get('AIRPODS_PW_LINK',shutil.which('pw-link') or '/run/current-system/sw/bin/pw-link')
 log=logging.getLogger('handoff')
 
 def family(s):
@@ -30,17 +32,57 @@ class Adapter:
         self.graph_revision=0; self.relinked=set(); self.audio_check=None; self.last_state=None; self.number=0; self.transport='unknown'; self.running=True; self.fatal=asyncio.Event()
         self.lock=asyncio.Lock(); self.ipc_lock=asyncio.Lock(); self.snapshot_lock=asyncio.Lock(); self.recovery=None; self.audio_lock=asyncio.Lock(); self.graph_changed=asyncio.Event(); self.transport_changed=self.graph_changed; self.last_audio_repair=-1e9; self.pause_tasks=set(); self.pause_armed=False; self.player_versions={}; self.uncertain_players=set()
 
+        self.resuming=False; self.resume_task=None; self.sleep_revision=0
+        self.media_modes=set()
+        self.connection=ManualConnection(self,MAC)
+        self.profile_attempted=None
+        self.call_report_key=None; self.call_report_sent=None; self.call_report_task=None
+        self.edge_repairs=set(); self.last_call_audio_repair=None
+        self.call_audio=CallAudioGuard(os.environ.get('AIRPODS_PW_CAT',shutil.which('pw-cat') or '/run/current-system/sw/bin/pw-cat'),lambda: self.control.publish() if self.control else None)
+
+    def local_mode(self):
+        if self.policy.local_call:return 'call'
+        if not self.policy.media():return 'idle'
+        modes=self.media_modes
+        return next(iter(modes)) if len(modes)==1 else 'mixed' if modes else 'media'
+
+    async def run_process(self, *args, timeout=3):
+        """Reap helpers on timeout and cancellation, including service shutdown."""
+        proc=await asyncio.create_subprocess_exec(*args,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+        try:
+            out,err=await asyncio.wait_for(proc.communicate(),timeout)
+            return proc.returncode==0,out
+        except asyncio.TimeoutError:
+            return False,b''
+        finally:
+            if proc.returncode is None:
+                try:proc.kill()
+                except ProcessLookupError:pass
+                await proc.wait()
+
+    @staticmethod
+    def valid_routing_event(e):
+        if not isinstance(e,dict):return False
+        if type(e.get('version')) is not int or e['version'] not in (1,2):return False
+        if any(type(e.get(k)) is not int or e[k]<0 for k in ('sequence','generation')):return False
+        if any(type(e.get(k)) is not bool for k in ('connected','ready')):return False
+        if any(k in e and type(e[k]) is not bool for k in ('release_request','manual_request')):return False
+        return all(e.get(key,'unknown') in values for key,values in (
+            ('owner',('unknown','none','linux','remote')),('source',('unknown','none','linux','remote')),
+            ('remote_activity',('unknown','idle','active')),('source_kind',('unknown','idle','media','call'))))
+
     def spawn(self, coro):
         task=asyncio.create_task(coro); self.tasks.add(task); task.add_done_callback(self.tasks.discard)
         def done(t):
             if not t.cancelled() and t.exception():
-                log.error('adapter task failed: %s',t.exception()); self.policy.healthy=False; self.evaluate('adapter-failure'); self.fatal.set()
+                log.error('adapter task failed: %s',t.exception()); self.fatal.set(); self.policy.healthy=False; self.evaluate('adapter-failure')
         task.add_done_callback(done); return task
 
     def evaluate(self, reason):
-        now=asyncio.get_running_loop().time(); self.policy.healthy=self.pw_ready and self.mpris_ready and not self.uncertain_players
+        now=asyncio.get_running_loop().time(); self.policy.healthy=self.pw_ready and self.mpris_ready and not self.uncertain_players and not self.fatal.is_set() and not self.resuming; self.policy.call_healthy=self.pw_ready and not self.fatal.is_set() and not self.resuming
+        self.policy.observe_call_audio(now,self.audio_active() and self.connection.phase!='disconnecting')
         if self.policy.owner=='linux' and self.policy.source=='linux' and self.policy.media():self.pause_armed=True
-        action=self.policy.decide(now)
+        action=None if self.connection.phase=='disconnecting' else self.policy.decide(now)
         if self.last_state != self.policy.state or action:
             self.number+=1
             log.info('event=%s reason=%s state=%s->%s owner=%s source=%s kind=%s remote=%s media=%s action=%s shadow=%s generation=%s cooldown_ms=%s',
@@ -50,9 +92,46 @@ class Adapter:
         deadline=self.policy.deadline(now)
         if deadline is not None: self.timer=asyncio.get_running_loop().call_at(deadline,self.evaluate,'deadline')
         if action: self.spawn(self.command(action,self.policy.inflight_token))
+        self.sync_call_report()
+        _,call_sink=self.bluez_node()
+        want_call_audio=(self.policy.local_call and self.policy.call_proven and not self.policy.manual_remote and self.policy.connected and self.policy.ready
+                         and not self.policy.suspended and not self.shadow and not self.connection.auto_paused
+                         and os.environ.get('AIRPODS_CALL_AUDIO_GUARD','0')!='0'
+                         and self.connection.phase!='disconnecting' and call_sink is not None
+                         and (self.policy.owner=='linux' or self.call_audio.active))
+        self.call_audio.update(want_call_audio,call_sink['props']['node.name'] if call_sink else None,self.policy.call_serial)
         if self.control:self.control.publish()
-        if self.audio_eligible(self.policy.context()) and any(edge[0] not in self.relinked for edge in self.stalled_output_links()) and (self.audio_check is None or self.audio_check.done()):
+        needs_profile=(not self.connection.profile and self.connection.device_path and self.profile_attempted!=self.policy.context())
+        if self.audio_eligible(self.policy.context()) and (needs_profile or self.audio_sink_failed() or self.pending_audio_links()) and (self.audio_check is None or self.audio_check.done()):
             self.audio_check=self.spawn(self.ensure_audio(self.policy.context(),now))
+
+    def sync_call_report(self):
+        p=self.policy
+        if self.shadow or self.resuming or self.fatal.is_set() or not p.connected or not p.ready or p.suspended or self.connection.phase=='disconnecting':return
+        active=p.local_call and p.call_proven and not p.manual_remote
+        # Never announce an unproven new call over an existing iPhone call.
+        if not active and self.call_report_sent is not True:return
+        key=(p.generation,p.call_serial,active)
+        if key==self.call_report_key:return
+        self.call_report_key=key
+        if self.call_report_task and not self.call_report_task.done():self.call_report_task.cancel()
+        self.call_report_task=self.spawn(self.send_call_report(key))
+
+    async def send_call_report(self,key):
+        for delay in (0,1,3):
+            if delay:await asyncio.sleep(delay)
+            p=self.policy
+            if key!=self.call_report_key or key!=(p.generation,p.call_serial,p.local_call and p.call_proven and not p.manual_remote) or not p.connected or not p.ready or p.suspended:return
+            async with self.ipc_lock:
+                if key!=self.call_report_key or key!=(p.generation,p.call_serial,p.local_call and p.call_proven and not p.manual_remote) or not p.connected or not p.ready or p.suspended:return
+                # Conservatively withdraw after hangup even if cancellation loses a start ACK.
+                if key[2]:self.call_report_sent=True
+                ok,_=await self._cli('switching','call-start' if key[2] else 'call-end')
+            if ok:
+                self.call_report_sent=key[2]
+                log.info('call report sent active=%s generation=%s; peer acceptance unconfirmed',key[2],key[0])
+                return
+        log.warning('call report could not be sent; no peer protection assumed')
 
     async def cli(self, *args):
         async with self.ipc_lock:
@@ -60,10 +139,13 @@ class Adapter:
 
     async def _cli(self, *args):
         proc=await asyncio.create_subprocess_exec(CTL,'--session',*args,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
-        try: out,err=await asyncio.wait_for(proc.communicate(),6)
+        try: out,err=await asyncio.wait_for(proc.communicate(),21)
+        except asyncio.CancelledError:
+            if proc.returncode is None:proc.kill()
+            await proc.wait();raise
         except asyncio.TimeoutError:
-            proc.kill(); await proc.wait(); return False,''
-        return proc.returncode==0,out.decode(errors='replace')
+            proc.kill(); await proc.wait(); return False,'AirPods session request timed out'
+        return proc.returncode==0,(out if proc.returncode==0 else err or out).decode(errors='replace')
 
     async def command(self, action, token):
         async with self.lock:
@@ -75,22 +157,24 @@ class Adapter:
             async with self.ipc_lock:
                 # Validate *after* waiting for the IPC lock. New call/pause/route events fence queued work.
                 safe=self.command_eligible(action,token)
-                args=('switching','take-media') if action in ('restore','claim') else ('switching',action)
+                args=('switching','take-call') if action=='recover-call' else ('switching','take-media') if action in ('restore','claim') else ('switching','take' if action=='take-idle' else action)
                 ok,out=await self._cli(*args) if safe else (False,'')
-            confirmed=ok and ('owner linux' if action in ('take','restore','claim') else 'owner remote') in out
+            confirmed=ok and ('owner linux' if action in ('take','restore','claim','take-idle','recover-call') else 'owner remote') in out
             now=asyncio.get_running_loop().time()
             applied=self.policy.result(now,action,confirmed,token)
             if applied:self.last_command_error=None if confirmed else 'Не удалось подтвердить переключение. Можно повторить вручную.'
             log.info('command=%s confirmed=%s applied=%s command_ms=%d play_to_ack_ms=%s reason=%s',action,confirmed,applied,int((now-started)*1000),int((now-self.policy.play_started)*1000) if self.policy.play_started is not None else None,'acknowledged' if confirmed else 'precondition-or-ack-failed; no retry')
             self.evaluate('command-result')
-            if applied and confirmed and action in ('take','restore','claim'):self.spawn(self.ensure_audio(self.policy.context(),now))
+            if applied and confirmed and action in ('take','restore','claim','recover-call'):self.spawn(self.ensure_audio(self.policy.context(),now))
             if confirmed and action=='release' and self.policy.peer_requested and self.policy.owner=='remote':self.spawn(self.pause_for_remote(self.policy.context()))
 
     def command_eligible(self,action,token):
         p=self.policy
-        if not (p.valid(token) and p.connected and p.ready and p.healthy and not p.suspended):return False
+        if not (p.valid(token) and p.connected and p.ready and (p.healthy or p.local_call and p.call_healthy is True) and not p.suspended) or self.connection.phase=='disconnecting':return False
         if action=='release':return p.owner=='linux' and not p.protected()
+        if action=='recover-call':return (p.local_call and p.call_proven and not p.manual_remote and not p.remote_call and (p.source_kind in ('idle','media') or p.source=='linux' and p.source_kind=='call') and p.remote!='unknown')
         if p.remote_call:return False
+        if action=='take-idle':return p.prefer_idle_pc and p.both_idle() and not p.intent
         if action=='restore':return p.local_focus and p.protected()
         if action=='claim':return (p.protected() or p.inflight_manual) and p.remote=='active' and p.source_kind=='media'
         return action=='take' and p.remote=='idle' and (p.protected() or p.inflight_manual)
@@ -111,14 +195,11 @@ class Adapter:
         return self.transport
 
     def audio_eligible(self,context):
-        return context==self.policy.context() and self.policy.connected and self.policy.owner=='linux' and not self.policy.remote_call and not self.policy.suspended and self.policy.healthy and self.policy.protected()
+        return context==self.policy.context() and not (self.policy.local_call and self.policy.call_lease.transport_failed and self.policy.call_lease.attempts>=3) and self.connection.phase!='disconnecting' and self.policy.connected and self.policy.owner=='linux' and (not self.policy.remote_call or self.policy.local_call and self.policy.call_proven and self.policy.remote=='idle') and not self.policy.suspended and (self.policy.healthy or self.policy.local_call and self.policy.call_healthy is True) and self.policy.protected()
 
     async def pulse(self,*args):
-        proc=await asyncio.create_subprocess_exec(PACTL,*args,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
-        try:out,err=await asyncio.wait_for(proc.communicate(),3)
-        except asyncio.TimeoutError:
-            proc.kill();await proc.wait();return False
-        return proc.returncode==0
+        ok,_=await self.run_process(PACTL,*args)
+        return ok
 
     async def wait_audio(self,predicate,timeout):
         deadline=asyncio.get_running_loop().time()+timeout
@@ -148,28 +229,39 @@ class Adapter:
         return result
 
     async def link_command(self,*args):
-        proc=await asyncio.create_subprocess_exec(PW_LINK,*map(str,args),stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.DEVNULL)
-        try:await asyncio.wait_for(proc.wait(),3)
-        except asyncio.TimeoutError:proc.kill();await proc.wait();return False
-        return proc.returncode==0
+        ok,_=await self.run_process(PW_LINK,*map(str,args))
+        return ok
+
+    def stable_edge(self,output,input_):
+        def serial(port):
+            return ((self.nodes.get(port,{}).get('info') or {}).get('props') or {}).get('object.serial',port)
+        return (self.policy.generation,serial(output),serial(input_))
 
     async def repair_output_links(self,context):
         if self.shadow or not self.audio_eligible(context) or self.policy.source!='linux':return
         repaired=0
         for identity,output,input_ in self.stalled_output_links():
-            if identity in self.relinked:continue
+            edge=self.stable_edge(output,input_)
+            if identity in self.relinked or edge in self.edge_repairs:continue
             if not self.audio_eligible(context) or self.policy.source!='linux':return
             if (identity,output,input_) not in self.stalled_output_links():continue
             if output is None or input_ is None:continue
             if len(self.relinked)>=128:
                 log.warning('output-link repair budget exhausted; no further mutations');return
             self.relinked.add(identity)
+            self.edge_repairs.add(edge)
             # Re-create only a proven stalled edge into this A2DP sink, leaving mic/effect chain intact.
-            removed=await self.link_command('-d',output,input_)
-            if not removed:continue
-            # Undo the temporary disconnection even if ownership changes during the command.
-            restored=await self.link_command(output,input_)
-            if not restored:restored=await self.link_command(output,input_)
+            try:
+                removed=await self.link_command('-d',output,input_)
+                if not removed:continue
+                # Undo the temporary disconnection even if ownership changes during the command.
+                restored=await self.link_command(output,input_)
+                if not restored:restored=await self.link_command(output,input_)
+            except asyncio.CancelledError:
+                # Cancellation can lose the delete ACK after PipeWire applied it.
+                # Restore our edge before shutting down the helper/session.
+                await self.link_command(output,input_)
+                raise
             repaired+=int(restored)
             log.log(logging.INFO if restored else logging.ERROR,'stalled A2DP output-link repaired=%s edge=%s; one attempt per link generation',restored,identity)
         return repaired
@@ -185,7 +277,7 @@ class Adapter:
 
     def pending_audio_links(self):
         return (self.policy.source=='linux' and len(self.relinked)<128
-                and any(edge[0] not in self.relinked for edge in self.stalled_output_links()))
+                and any(out is not None and inp is not None and identity not in self.relinked and self.stable_edge(out,inp) not in self.edge_repairs for identity,out,inp in self.stalled_output_links()))
 
     async def wait_audio_flow(self,context,timeout,stop_on_error=False):
         """Repair newly arriving graph edges in this attempt, not a later queued check."""
@@ -208,8 +300,28 @@ class Adapter:
         if self.shadow:return
         async with self.audio_lock:
             if not self.audio_eligible(context):return
+            opened_profile=False
+            # Passive AACP may be connected without an A2DP stream. Open audio
+            # only after a local session owns the channel, never just on login.
+            if not self.connection.profile and self.connection.device_path:
+                task=self.connection.task
+                if task and not task.done():await asyncio.shield(task)
+                if not self.audio_eligible(context):return
+                if not self.connection.profile:
+                    if self.profile_attempted==context:return
+                    self.profile_attempted=context
+                    self.connection.request()
+                    task=self.connection.task
+                    if task:await asyncio.shield(task)
+                    opened_profile=self.connection.profile
+                if not self.audio_eligible(context):return
             if self.audio_active():
                 log.info('audio-active ack_to_active_ms=%d source=linux path=already-ready',int((asyncio.get_running_loop().time()-ack_at)*1000));return
+            if opened_profile and self.bluez_node()[1] is None:
+                # BlueZ's method reply may precede WirePlumber node creation.
+                # Wait for that graph event before diagnosing a missing sink.
+                await self.wait_audio(lambda: self.bluez_node()[1] is not None or not self.audio_eligible(context),4)
+                if not self.audio_eligible(context):return
             # Error and stalled-edge events end the grace immediately. Only an
             # unremarkable handoff still gets the natural-transition timeout.
             def progress():
@@ -229,13 +341,16 @@ class Adapter:
                 if self.audio_active():
                     log.info('audio-active ack_to_active_ms=%d source=linux path=transport-snapshot',int((asyncio.get_running_loop().time()-ack_at)*1000));return
             now=asyncio.get_running_loop().time()
-            if now-self.last_audio_repair<10:
+            call_repair=(self.policy.call_serial,self.policy.generation,self.policy.call_recoveries) if self.policy.local_call and self.policy.call_proven else None
+            fresh_call_repair=call_repair is not None and call_repair!=self.last_call_audio_repair
+            if now-self.last_audio_repair<10 and not fresh_call_repair:
                 log.warning('audio recovery suppressed: cooldown; no reconnect/profile reset');return
             _,info=self.bluez_node()
             if not info:
                 log.warning('audio recovery unavailable: no matching A2DP sink; no reconnect');return
             sink=info['props']['node.name']
             self.last_audio_repair=now
+            if call_repair is not None:self.last_call_audio_repair=call_repair
             log.warning('audio recovery: one suspend/resume of existing sink; source=%s transport=%s node=%s first_repair_ms=%d',self.policy.source,self.transport,info.get('state'),int((now-ack_at)*1000))
             attempted=False
             try:
@@ -264,6 +379,12 @@ class Adapter:
                 ready=self.audio_active()
             log.info('audio recovery result ready=%s transport=%s source=%s ack_to_check_ms=%d; no further retries',ready,self.transport,self.policy.source,int((asyncio.get_running_loop().time()-ack_at)*1000))
             if ready:log.info('audio-active ack_to_active_ms=%d source=linux path=recovered',int((asyncio.get_running_loop().time()-ack_at)*1000))
+            elif self.policy.local_call and self.policy.call_proven and not self.policy.manual_remote and not self.policy.remote_call:
+                # A failed audio path is a failed recovery even if ownership was ACKed.
+                # Re-enter the same bounded episode instead of declaring the call held.
+                self.policy.call_lease.transport_failed=True
+                self.evaluate('call-transport-recovery-failed')
+
 
     async def verify_local_play(self,context):
         # A stream/route event may be ready immediately; there is no fixed sleep.
@@ -284,27 +405,37 @@ class Adapter:
                 except (RuntimeError,asyncio.TimeoutError):log.warning('remote takeover: player Pause unavailable')
 
     def schedule_recovery(self):
+        if self.policy.suspended or self.resuming or self.fatal.is_set():return
         if self.recovery is None or self.recovery.done():
             self.recovery=self.spawn(self.recover())
 
     async def recover(self):
         for delay in (0,1,3,8):
             if delay:await asyncio.sleep(delay)
+            if self.policy.suspended or self.resuming or self.fatal.is_set():return
             if self.policy.connected and self.policy.ready and self.policy.generation is not None:return
             try:
-                reply=await self.call(self.system,'org.bluez','/org/bluez/hci0/dev_'+MAC,'org.freedesktop.DBus.Properties','Get','ss',['org.bluez.Device1','Connected'])
+                path=self.connection.device_path
+                if not path:
+                    await self.connection.refresh()
+                    path=self.connection.device_path
+                if not path:return
+                reply=await self.call(self.system,'org.bluez',path,'org.freedesktop.DBus.Properties','Get','ss',['org.bluez.Device1','Connected'])
                 if not reply[0].value:return
             except (RuntimeError,asyncio.TimeoutError):return
+            if self.policy.suspended or self.resuming or self.fatal.is_set():return
             await self.snapshot()
             if self.policy.connected and self.policy.ready and self.policy.generation is not None:return
         if not self.policy.connected:log.warning('bounded AACP recovery ended; waiting for next BlueZ event')
 
     async def snapshot(self):
         async with self.snapshot_lock:
+            context=self.policy.context(); sleep_revision=self.sleep_revision
+            if self.policy.suspended or self.resuming:return
             ok,out=await self.cli('switching','status')
             if not ok: return
             values=dict(line.split(' ',1) for line in out.splitlines() if ' ' in line)
-            if self.policy.generation is None:
+            if self.policy.context()==context and self.sleep_revision==sleep_revision and not self.policy.suspended and not self.resuming and self.policy.generation is None:
                 self.policy.route(asyncio.get_running_loop().time(),{
                     'connected':True,'ready':values.get('multipoint')=='ready',
                     'owner':values.get('owner','unknown'),'remote_activity':values.get('remote-activity','unknown')},'snapshot')
@@ -328,20 +459,25 @@ class Adapter:
             pid=creds[0][0]
             if Path('/proc',str(pid),'exe').resolve()!=Path(CTL).resolve(): return
             e=json.loads(data)
-            if e.get('version') not in (1,2) or type(e.get('sequence')) is not int: return
+            if not self.valid_routing_event(e):return
             prev=self.seq.get(pid,0)
             if e['sequence']<=prev: return
             if prev and e['sequence']!=prev+1:
                 self.policy.invalidate(); log.warning('AACP event gap; asynchronous decisions invalidated')
             self.seq[pid]=e['sequence']
             self.observe_route(e,(pid,e['generation']))
-        except (ValueError,KeyError,OSError): log.warning('invalid routing event ignored')
+        except (ValueError,KeyError,OSError,TypeError): log.warning('invalid routing event ignored')
 
     def observe_route(self,e,generation):
         if self.policy.generation!=generation:self.pause_armed=False
         self.policy.route(asyncio.get_running_loop().time(),e,generation)
+        if e.get('connected') and e.get('ready'):self.connection.control_ready()
         if not e.get('connected'):self.pause_armed=False
-        if e.get('release_request') is True:
+        if e.get('manual_request') is True:
+            self.policy.manual_peer_request(asyncio.get_running_loop().time())
+            self.last_command_error=None
+            log.info('peer manual route selected; local call/media retention cancelled')
+        elif e.get('release_request') is True:
             self.policy.peer_request(asyncio.get_running_loop().time());log.info('peer ownership request protected=%s; defer while local audio session is active',self.policy.protected())
         self.transport_changed.set()
         if self.pause_armed and not self.policy.protected() and self.policy.owner=='remote' and self.policy.remote=='active':
@@ -349,6 +485,7 @@ class Adapter:
             self.spawn(self.pause_for_remote(self.policy.context()))
         self.evaluate('aacp-routing')
         if not e.get('connected'):self.schedule_recovery()
+        if not e.get('connected'):self.connection.schedule_auto(5)
 
     async def call(self,bus,destination,path,interface,member,signature='',body=None):
         reply=await asyncio.wait_for(bus.call(Message(destination=destination,path=path,interface=interface,member=member,signature=signature,body=body or [])),3)
@@ -359,11 +496,14 @@ class Adapter:
         version=self.player_versions.get(name,0)
         try:
             owner=(await self.call(self.session,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','GetNameOwner','s',[name]))[0]
+            if version!=self.player_versions.get(name,0):return False
             self.owners[owner]=name
             pid=(await self.call(self.session,'org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','GetConnectionUnixProcessID','s',[owner]))[0]
+            if self.owners.get(owner)!=name:return False
             self.identities[name]=(pid,family(name))
-            props=(await self.call(self.session,name,'/org/mpris/MediaPlayer2','org.freedesktop.DBus.Properties','GetAll','s',['org.mpris.MediaPlayer2.Player']))[0]
-            if version!=self.player_versions.get(name,0) or self.owners.get(owner)!=name:return
+            props=(await self.call(self.session,owner,'/org/mpris/MediaPlayer2','org.freedesktop.DBus.Properties','GetAll','s',['org.mpris.MediaPlayer2.Player']))[0]
+            if self.owners.get(owner)!=name:return False
+            if version!=self.player_versions.get(name,0):return name not in self.uncertain_players
             self.uncertain_players.discard(name)
             self.policy.player(asyncio.get_running_loop().time(),name,props['PlaybackStatus'].value=='Playing',baseline)
             self.correlate(); self.evaluate('mpris-initial-snapshot')
@@ -373,7 +513,8 @@ class Adapter:
             return False
 
     def correlate(self):
-        streams=set(); covered=set(); communication=False
+        if self.policy.suspended or self.resuming:return
+        streams=set(); covered=set(); communication=False; modes=set()
         clients={key:(obj.get('info') or {}).get('props',{}) for key,obj in self.nodes.items() if obj.get('type')=='PipeWire:Interface:Client'}
         for key,obj in self.nodes.items():
             info=obj.get('info') or {}; props=stream_props(self.nodes,obj)
@@ -389,7 +530,9 @@ class Adapter:
             for name,(pid,app) in self.identities.items():
                 if p==str(pid) or (app and app==f):
                     covered.add(key)
-                    if info.get('state')=='running' or name in self.policy.streams and self.policy.players.get(name):streams.add(name)
+                    if info.get('state')=='running' or name in self.policy.streams and self.policy.players.get(name):
+                        streams.add(name)
+                        if self.policy.players.get(name):modes.add(media_mode(props))
         old_streams=self.policy.streams
         now=time.monotonic()
         fallback=self.playback_tracker.observe(now,candidates(self.nodes,covered)) if self.pw_ready else set()
@@ -399,6 +542,10 @@ class Adapter:
             self.policy.player(now,key,True,baseline=key in self.playback_tracker.baseline)
             log.info('PipeWire fallback playback started; baseline=%s source=%s',key in self.playback_tracker.baseline,key)
         self.fallback_streams=fallback
+        for key,obj in self.nodes.items():
+            props=stream_props(self.nodes,obj)
+            if f"pw:{key}:{props.get('object.serial',key)}" in fallback:modes.add(media_mode(props))
+        self.media_modes=modes
         self.policy.streams=streams|fallback
         if self.policy.streams != old_streams:
             log.info('media-stream-match mpris=%s fallback=%s; notifications/captures/muted excluded',len(streams),len(fallback))
@@ -426,6 +573,7 @@ class Adapter:
                 if old:
                     self.owners.pop(old,None); self.identities.pop(name,None)
                     self.policy.player(asyncio.get_running_loop().time(),name,False)
+                    self.policy.players.pop(name,None)
                 if new:self.spawn(self.add_player(name,not self.mpris_ready))
                 self.correlate(); self.evaluate('mpris-owner-change')
             return
@@ -434,14 +582,16 @@ class Adapter:
             interface,changes,invalidated=msg.body
             if interface=='org.mpris.MediaPlayer2.Player':
                 if 'PlaybackStatus' in changes:
+                    self.player_versions[name]=self.player_versions.get(name,0)+1
                     self.uncertain_players.discard(name)
                     log.info('MPRIS playback=%s source=%s baseline=%s',changes['PlaybackStatus'].value,self.identities.get(name,(None,''))[1],not self.mpris_ready)
-                    self.policy.player(asyncio.get_running_loop().time(),name,changes['PlaybackStatus'].value=='Playing',not self.mpris_ready)
+                    self.policy.player(asyncio.get_running_loop().time(),name,changes['PlaybackStatus'].value=='Playing',not self.mpris_ready or self.resuming or self.policy.suspended)
                     self.correlate(); self.evaluate('mpris-playback-edge')
                     if changes['PlaybackStatus'].value=='Playing':
                         if self.policy.remote!='idle' or not self.policy.ready:self.spawn(self.snapshot())
                         self.spawn(self.verify_local_play(self.policy.context()))
                 elif 'PlaybackStatus' in invalidated:
+                    self.player_versions[name]=self.player_versions.get(name,0)+1
                     self.uncertain_players.add(name);self.policy.invalidate(clear_lease=False);self.evaluate('mpris-status-unknown');self.spawn(self.refresh_player(name))
 
     async def refresh_player(self,name):
@@ -452,12 +602,18 @@ class Adapter:
         log.warning('MPRIS refresh exhausted; waiting for status/owner event, no playback inferred')
 
     def system_signal(self,msg):
+        self.connection.signal(msg)
         if msg.message_type!=MessageType.SIGNAL:return
         if msg.interface=='org.freedesktop.login1.Manager' and msg.member=='PrepareForSleep':
             sleeping=msg.body[0]
-            if sleeping:self.reset_session_tracking()
+            self.sleep_revision+=1
+            if self.resume_task and not self.resume_task.done():self.resume_task.cancel()
+            self.resuming=True; self.mpris_ready=False
+            if sleeping:
+                self.reset_session_tracking()
+                if self.recovery and not self.recovery.done():self.recovery.cancel()
             self.policy.sleep(asyncio.get_running_loop().time(),sleeping);self.evaluate('sleep' if sleeping else 'resume')
-            if not sleeping:self.spawn(self.resume_baseline())
+            if not sleeping:self.resume_task=self.spawn(self.resume_baseline())
             return
         if msg.interface=='org.freedesktop.DBus.Properties' and msg.member=='PropertiesChanged':
             interface,changes,_=msg.body
@@ -466,7 +622,7 @@ class Adapter:
                     self.transport=changes['State'].value;self.transport_changed.set(); self.evaluate('bluez-transport')
                 if interface=='org.bluez.Device1' and 'Connected' in changes:
                     if changes['Connected'].value:
-                        self.policy.generation=None; self.schedule_recovery()
+                        self.schedule_recovery()
                     else:
                         self.policy.route(asyncio.get_running_loop().time(),{'connected':False},None)
                         self.evaluate('bluez-disconnected')
@@ -492,18 +648,17 @@ class Adapter:
         self.playback_tracker.reset()
         for key in self.fallback_streams:self.policy.players.pop(key,None)
         self.fallback_streams.clear()
+        self.media_modes.clear()
         self.policy.streams.clear()
         if self.call_timer:self.call_timer.cancel();self.call_timer=None
 
     async def refresh_graph(self):
         revision=self.graph_revision
-        proc=await asyncio.create_subprocess_exec(os.environ.get('AIRPODS_PW_DUMP','/run/current-system/sw/bin/pw-dump'),'--no-colors',stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
-        try:out,_=await asyncio.wait_for(proc.communicate(),4)
-        except asyncio.TimeoutError:
-            proc.kill();await proc.wait();log.warning('resume graph snapshot timed out');return False
-        if proc.returncode or len(out)>8_000_000:return False
+        ok,out=await self.run_process(os.environ.get('AIRPODS_PW_DUMP','/run/current-system/sw/bin/pw-dump'),'--no-colors',timeout=4)
+        if not ok or len(out)>8_000_000:return False
         try:objects=json.loads(out)
         except (ValueError,UnicodeError):return False
+        if not isinstance(objects,list) or any(not isinstance(obj,dict) or type(obj.get('id')) is not int for obj in objects):return False
         if revision==self.graph_revision:
             self.nodes={obj['id']:obj for obj in objects if obj.get('info') is not None}
             self.graph_revision+=1
@@ -511,13 +666,18 @@ class Adapter:
         return True
 
     async def resume_baseline(self):
+        revision=self.sleep_revision
+        self.resuming=True
         self.mpris_ready=False
         await asyncio.gather(*(self.add_player(name,True) for name in list(self.identities)))
         refreshed=await self.refresh_graph()
-        self.mpris_ready=True
+        if revision!=self.sleep_revision or self.policy.suspended:return
         if not refreshed:
             log.warning('resume graph baseline unavailable; stopping adapter for fresh initialization')
-            self.fatal.set();return
+            self.fatal.set();self.evaluate('resume-failed');return
+        self.reset_session_tracking()
+        self.resuming=False
+        self.mpris_ready=True
         self.correlate();self.schedule_recovery();self.evaluate('resume-baseline')
 
     async def pipewire(self):
@@ -547,9 +707,35 @@ class Adapter:
             raise RuntimeError('PipeWire event monitor exited')
         finally:
             self.pw_ready=False;self.policy.local_focus=False;self.policy.invalidate();self.evaluate('pipewire-unavailable')
-            if proc.returncode is None:proc.terminate();await proc.wait()
+            if proc.returncode is None:
+                try:proc.kill()
+                except ProcessLookupError:pass
+                await proc.wait()
 
     async def main(self):
+        try:
+            await self.run()
+        finally:
+            self.fatal.set(); self.policy.suspended=True; self.policy.invalidate()
+            for handle in (self.timer,self.call_timer,self.connection.auto_timer):
+                if handle:handle.cancel()
+            tasks=list(self.tasks)
+            for task in tasks:task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
+            if self.call_report_sent and not self.shadow:
+                try:await asyncio.wait_for(self.cli('switching','call-end'),2)
+                except (OSError,asyncio.TimeoutError):pass
+            await self.call_audio.close()
+            if self.control:await self.control.close()
+            for name in ('session','system'):
+                bus=getattr(self,name,None)
+                if bus is not None:bus.disconnect()
+            if hasattr(self,'sock'):
+                asyncio.get_running_loop().remove_reader(self.sock.fileno())
+                self.sock.close();self.path.unlink(missing_ok=True)
+            if hasattr(self,'guard'):self.guard.close()
+
+    async def run(self):
         self.routing_socket()
         self.control=ControlServer(self)
         await self.control.start()
@@ -563,22 +749,21 @@ class Adapter:
         self.mpris_ready=True
         try:
             objects=(await self.call(self.system,'org.bluez','/','org.freedesktop.DBus.ObjectManager','GetManagedObjects'))[0]
+            self.connection.load(objects)
             for path,interfaces in objects.items():
                 if MAC in path and 'org.bluez.MediaTransport1' in interfaces:
                     self.transport=interfaces['org.bluez.MediaTransport1']['State'].value
         except (RuntimeError,KeyError,asyncio.TimeoutError):log.warning('Initial BlueZ transport snapshot unavailable')
         self.schedule_recovery(); self.spawn(self.pipewire())
-        log.info('event adapters ready shadow=%s; no Bluetooth reconnection or profile reset policy',self.shadow)
-        await asyncio.wait([asyncio.create_task(self.session.wait_for_disconnect()),asyncio.create_task(self.system.wait_for_disconnect()),asyncio.create_task(self.fatal.wait())],return_when=asyncio.FIRST_COMPLETED)
+        self.connection.start_auto(os.environ.get('AIRPODS_AUTO_CONNECT','1')!='0')
+        self.policy.prefer_idle_pc=os.environ.get('AIRPODS_PREFER_IDLE_PC','1')!='0'
+        log.info('event adapters ready shadow=%s; background connect=%s; idle-PC preference=%s; connection never claims ownership',
+                 self.shadow,self.connection.auto_enabled,self.policy.prefer_idle_pc)
+        await asyncio.wait([self.spawn(self.session.wait_for_disconnect()),self.spawn(self.system.wait_for_disconnect()),self.spawn(self.fatal.wait())],return_when=asyncio.FIRST_COMPLETED)
         raise RuntimeError('Event adapter disconnected; restart from fresh baselines')
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description='Event-driven AirPods media handoff (experimental)')
-    parser.add_argument('--shadow',action='store_true',help='Log decisions without switching or changing audio')
-    parser.add_argument('--device',default=os.environ.get('AIRPODS_DEVICE',''),help='Paired AirPods Bluetooth address, or AIRPODS_DEVICE')
-    args=parser.parse_args()
-    if not re.fullmatch(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}',args.device):parser.error('--device or AIRPODS_DEVICE must be a Bluetooth address (AA:BB:CC:DD:EE:FF)')
-    MAC=args.device.upper().replace(':','_')
+    parser=argparse.ArgumentParser();parser.add_argument('--shadow',action='store_true');args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     def terminate(*_):raise KeyboardInterrupt
     signal.signal(signal.SIGTERM,terminate)
