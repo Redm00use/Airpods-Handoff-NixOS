@@ -36,4 +36,19 @@ The user-only UNIX control socket checks peer UID and has mode 0600. Status subs
 
 An explicit return re-arms a single user-authorized attempt. Pinning prevents local release while idle; it does not implement Apple's closed firmware ownership lock. Repeated autonomous contention stops at LOCAL_CONTESTED. The fresh controller-side call/unknown guard is preserved.
 
+Media recovery retains its single-attempt budget, re-armed after 30 seconds of
+sustained local ownership. Continuing calls use a separate persistent lease:
+at most three attempts per unresolved interruption, with cooldown reserved at
+dispatch. One sustained second of qualified local source, active BlueZ transport
+and a healthy running PipeWire graph renews the budget; ACK alone does not.
+Typed remote calls and unknown sources pause recovery. Hangup and sleep clear
+call intent; explicit phone routing cancels autonomous reclaim even during a call.
+MPRIS snapshots use unique D-Bus owners and playback revisions; resume blocks
+correlation and switching until fresh baselines are complete.
+
+Local mode reporting uses Communication/duplex call evidence first, then explicit
+media roles and known music applications. Untagged browser playback remains
+generic media. Optional Mac-like Bluetooth identity sets public adapter metadata,
+not Apple Account enrollment or host-to-host relay authentication.
+
 Known sink errors bypass the natural-transition grace. Recovery repairs newly arriving paused/init edges inside the current event-driven attempt and skips a redundant AACP CLI snapshot. The extra 300ms restore debounce is removed only for a proven local session and typed remote media; new-play debounce is retained.

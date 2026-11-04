@@ -1,70 +1,43 @@
 # Shared state — AirPods Handoff
 
-Last updated: 2026-11-04 (Europe/Kyiv).
-Status: latest fixes deployed; test voice call ended. Main routing scenarios passed with one remaining initial TikTok dropout; full MacBook parity is not established.
+Updated: 2026-11-04 (Europe/Kyiv). Experimental; full MacBook parity is not established.
 
-## Current objective
+## Repository and deployment
 
-Preserve stereo AAC, quiet background AACP connection and intentional manual routing while improving call handoff. Stable retention of a silent PC call against ordinary iPhone Play is NOT achieved.
+Current work combines upstream main through `59a936c` with the November 4 persistent-call, background-connection and manual-routing implementation. Consult `git log` for publication history. The user requested publication to Redm00use/Airpods-Handoff-NixOS main.
 
-## Repository baseline
-
-- Local HEAD: `2d7b1f2` (2026-10-29), with substantial uncommitted Python, Zig, Nix and panel changes. Do not reset or replace the working tree.
-- GitHub commit reviewed: `59a936c900bb86d42fa2651b2a4a779a1857c1ae` (2026-11-03). Selected fixes were adapted, not merged wholesale: its controller lacks newer local protocol/manual-route work.
-- The portable repository and deployed NixOS configuration are separate source trees. Editing this checkout alone does not deploy to the machine. Compare before copying; deployment must preserve device-specific configuration.
-- No commit or push performed in this session.
+This portable checkout and the machine's deployed NixOS configuration are separate source trees. Editing or pulling this repository does not deploy it. The latest local implementation was deployed before the publication merge; upstream integration itself has not been deployed.
 
 ## User decisions
 
-- Preserve stereo AAC and the selected external USB microphone. HFP testing was explicitly declined.
-- Manual AirPods selection on iPhone is allowed, including during a PC call. `manual_remote` cancels autonomous PC reclaim until fresh authorized PC intent.
-- Background control connection must not start A2DP or interrupt iPhone. When both devices are idle, prefer PC.
-- No extra applications. Integrate functions into existing services and Noctalia.
-- Preserve passive battery monitoring. Active Bluetooth/HID battery polling previously correlated with audio gaps and was removed.
+- Preserve stereo AAC, the selected external USB microphone, pairing and passive battery monitoring. HFP testing was declined; active Bluetooth/HID battery polling previously correlated with audio gaps.
+- Explicit iPhone AirPods selection is allowed even during a PC call. `manual_remote` cancels autonomous reclaim until fresh authorized PC intent.
+- Background connection must not start A2DP or interrupt iPhone. Prefer PC only when both hosts are confirmed idle.
+- No extra applications; use existing services and Noctalia.
 
-## Implemented locally
+## Current implementation
 
-- Control-only background AACP with bounded retries, independent on-demand A2DP and idle-PC preference (`src/airpods_connection.py`, policy).
-- Typed manual-route detection and native call reports in vendored controller; fixed relay length; separate cold-connect/operation budgets.
-- Call lifetime detection retains muted/quiet duplex sessions; bounded call recovery, manual-route fencing and call-report withdrawal.
-- Adapted upstream fixes: MPRIS revision/unique-owner fencing, string PipeWire client IDs, resume barrier, input validation, helper/socket cleanup, duplicate BlueZ generation protection, late sink-error handling, evidence-based panel modes and XDG preferences.
-- Explicit Return now invokes bounded audio repair for local ownership with typed idle/no source. Remote/unknown sources were not added to that repair path (`src/airpods_handoff_control.py`).
-- Zero-PCM call guard remains disabled by default; it previously failed hardware validation.
+- Control-only background AACP, bounded backoff and independent on-demand A2DP.
+- Persistent call lease: three attempts per unresolved interruption; renew only after one sustained second of qualified local source, active BlueZ transport and healthy running PipeWire graph. ACK alone is insufficient.
+- Typed remote calls and unknown sources block call claims. Preserve continuing PC intent without reviving completed or baseline calls.
+- Explicit phone selection cancels queued claims, withdraws native call reports and survives control reconnects. Native manual-route revision fences in-flight requests.
+- Scoped native Discord fallback retains only previously proven calls using matching VoiceEngine clients, process identity and process-owned UDP sockets. Client presence alone was rejected because clients survive hangup. See `docs/decisions/2026-11-04-quiet-discord-lifetime.md`.
+- Explicit PC return repairs typed local idle/no-source audio; stale peer-release work is cleared when manual mode ends at confirmed both-idle.
+- Upstream MPRIS revision/owner fences, string client IDs, resume barriers, input validation, helper/socket cleanup, late sink errors, panel modes and optional adapter identity retained.
+- Zero-PCM guard remains disabled by default. Score announcements alone did not prove prevention of automatic switching; no echo loop or unbounded reclaim.
 
-## Verification on 2026-11-04
+## Verification and limitations
 
-- Final staged system Python suite: 242 passed; the currently deployed first lease build passed 239. The rejected settling experiment passed 229 system/232 portable tests but failed its on-device scenario; those four tests are not part of the active tree. The new regression failed on the previous code.
-- Portable x86_64 Nix flake checks and system build passed. ARM was not tested.
-- Existing matching controller build has 54 passing protocol tests; controller was not changed during the November 4 merge.
-- Background reconnection: source stayed iPhone, PC A2DP off; user confirmed music without pauses.
-- Discord start: recognized as a call, AAC selected; user confirmed PC sound.
-- Silent muted Discord + ordinary iPhone Play: THREE automatic recoveries, followed by no audible audio from either device. User confirmed silence. This test FAILED stable call retention.
-- A direct quiet test WAV stalled. One suspend/resume of the existing AirPods sink restored playback; user heard the repeated signal. This proves repair of that episode, not prevention of future switching.
-- Latest explicit-return code was deployed after leaving the test call. Its new idle/no-source button path has automated coverage; hardware confirmation through the updated button is still pending.
+Before publication merge: 251 system Python tests, 254 portable Python tests and 57 native tests; x86_64 flake checks and system build passed. Publication merge: 254 Python tests and x86_64 flake checks passed, including native controller, CLI and module contracts. ARM untested.
 
-## Latest protocol evidence / open hypotheses
+Hardware confirmed quiet background reconnect without iPhone music pauses; Discord start audible in AAC; ordinary TikTok scrolling left Discord in AirPods and TikTok on phone speaker after one initial roughly one-second interruption. This initial gap remains unresolved.
 
-- A follow-up AACP-only capture again showed three recoveries and source becoming none. Do not treat owner=Linux as audible success.
-- Incoming score-only `audioRoutingScore=301` messages were observed. No incoming `Hijackv2`/`RoutedToBluetooth` reason appeared in that capture, so the current automatic-request score-response trigger did not run.
-- The meaning of the score-only messages is not established: they may be reports/replies rather than requests. Do not implement an echo loop or claim a proven negotiation fix from this evidence.
-- Observed peer/local connected-device states were ordinary 07/01 and 05/03 pairs; available captures do not establish a transition-state claim race.
-- Direct host-state opcode 0x44 is a research lead only. No arbitrary values were sent.
-- Raw captures and personal device identifiers are intentionally excluded from shared repository memory.
+Manual iPhone selection held during a detected Discord call. Re-enabling Discord sound did not steal it back; disconnect cleared the call flag. Missing-node fallback was unit-tested and replayed with real kernel metadata, but that specific branch was not observed in the running daemon's sampled graph. The final stale-release idle fix has automated coverage, without a new acoustic idle test.
 
-## Next bounded action
+Earlier lifetime-three-attempt recovery and the temporary settling-delay experiment failed hardware tests; they were superseded/reverted. Do not treat old test failures as the current design, or claim all call apps, firmware, sleep cycles and browser lifecycles were tested. Ownership ACK, source, transport, graph readiness and heard sound remain distinct evidence.
 
-Do not call the implementation identical to Apple. The remaining confirmed issue is a roughly one-second initial transfer/dropout when iPhone/TikTok first requests audio during the PC call. Three videos afterward remained on the phone speaker, and Discord sound was confirmed in AirPods. Investigate native arbitration to prevent the initial transfer; increasing retry counts cannot prove zero-gap behavior.
+## Next action and shared-account workflow
 
-Persistent-call lease is deployed. Quiet native Discord now has a narrowly scoped fallback tied to previously proven VoiceEngine client/process/UDP socket lifetime; client presence alone was tested and rejected because clients persist after hangup. See `docs/decisions/2026-11-04-quiet-discord-lifetime.md`. This is not a generic browser-call guarantee.
+Investigate bounded native arbitration to avoid the initial transfer gap; increasing retries is not proof of seamless switching. Keep raw captures, personal device identifiers and credentials outside shared files.
 
-Hardware-confirmed after that fix: manual iPhone route held while local_call=true/manual_remote=true, and re-enabling sound in the same Discord channel did not take it back. After explicit hangup, the call flag cleared. Missing-node retention was unit-tested and replayed with real kernel metadata, but the daemon's sampled deafened graph still contained audio nodes; do not overstate that specific branch's hardware validation.
-
-A final regression fix clears stale peer-release work when returning from manual mode to confirmed both-idle. 251 system Python tests and x86_64 Nix checks passed; 57 native tests remain the matched controller baseline. No new acoustic idle-selection test after the small final fix. No commit/push.
-
-## Shared-account workflow
-
-Both desktop applications must open this SAME checkout to share these files. Skills and STATE.md are repository files, not a shared chat history. Neither desktop application's authentication nor model selection is configured by this kit. Avoid simultaneous edits to the same files; record a short handoff in this state index.
-
-## Current immutable deployment
-
-Active final system: `/nix/store/zaskxhr83rfr1ib7z06scz7dwl04fja9-nixos-system-niri-26.05.20261026.718f670`. Previous persistent-call build: `/nix/store/0f78fh4fh4r80gfa3fmvhhnxd5q9p7ss-nixos-system-niri-26.05.20261026.718f670`. Final updates changed only the Python handler; controller, WirePlumber and passive batteries were not restarted. Preserve AAC/external mic and existing pairing.
+Both desktop accounts must open this same checkout to share Skills and this state. Files do not synchronize chat history or authentication. Avoid simultaneous edits to the same files; update this small index after meaningful work.

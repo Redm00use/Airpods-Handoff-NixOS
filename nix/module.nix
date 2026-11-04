@@ -12,13 +12,23 @@ in {
     keepCallTransport = mkOption { type = types.bool; default = false; description = "Keep an already-owned PC call audio transport clocked with zero PCM while muted/silent; no microphone recording."; };
     autoConnect = mkOption { type = types.bool; default = true; description = "Open the paired AACP control channel in the background, without connecting an audio profile or requesting ownership. Unavailable devices use bounded exponential backoff."; };
     preferIdlePC = mkOption { type = types.bool; default = true; description = "Select Linux when both hosts are confirmed idle; never infer phone idleness from missing state."; };
+    macLikeIdentity = {
+      enable = mkEnableOption "Mac-like Bluetooth identity (Apple DeviceID, laptop class and adapter name; no Apple Account enrollment)";
+      name = mkOption { type = types.strMatching "[^\n\r]+"; default = "Mac"; description = "Default Bluetooth adapter name. An existing BlueZ Alias may override this name."; };
+    };
     shadow = mkOption { type = types.bool; default = false; description = "Observe and log decisions without ownership, pause or audio commands."; };
   };
   config = mkIf cfg.enable {
     hardware.bluetooth.enable = mkDefault true;
-    hardware.bluetooth.settings = mkIf cfg.spoofAppleDeviceId {
-      General.DeviceID = mkDefault "bluetooth:004C:0000:0000";
-    };
+    hardware.bluetooth.settings.General = lib.mkMerge [
+      (mkIf (cfg.spoofAppleDeviceId || cfg.macLikeIdentity.enable) {
+        DeviceID = mkDefault "bluetooth:004C:0000:0000";
+      })
+      (mkIf cfg.macLikeIdentity.enable {
+        Name = mkDefault cfg.macLikeIdentity.name;
+        Class = mkDefault "0x00010c";
+      })
+    ];
     services.pipewire = {
       enable = mkDefault true;
       pulse.enable = mkDefault true;

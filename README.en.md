@@ -1,16 +1,36 @@
 # AirPods Handoff for NixOS
 
+## 0.4.0 base with November 4 improvements
+
+- A continuing PC call can make bounded guarded returns after an interrupting iPhone
+  call reports idle. Baseline calls, hangup, sleep, disconnect and unknown remote
+  states do not authorize that return.
+- Status/panel report call, music, video, game, mixed, media or idle from observed
+  stream roles and identities. Untagged browser content remains generic media.
+- MPRIS replies are fenced against newer playback/owner events; suspend/resume
+  suppresses decisions until fresh baselines are ready. Recovery discovers the
+  configured device across BlueZ adapters instead of assuming hci0.
+- Helper processes are reaped on cancellation/timeout; late sink errors trigger
+  bounded audio recovery. Microphone selection and A2DP/HFP remain WirePlumber's
+  responsibility.
+- Optional `services.airpodsHandoff.macLikeIdentity.enable = true` advertises
+  Apple DeviceID, laptop class and a configurable default name (`name = "Mac"`).
+  This is Bluetooth identification, **not Apple Account enrollment**, and cannot
+  guarantee that iPhone treats Linux as an authenticated Mac. Saved adapter Alias
+  can override the default Name.
+
+
 Experimental event-driven audio ownership handoff for AirPods Pro 2 USB-C, iPhone and Linux. [Detailed installation and status matrix (Russian)](README.md).
 
 This reuses a locally extended MIT-licensed `hacel/airpodsctl` controller. A Python FSM consumes BlueZ D-Bus, MPRIS, PipeWire and authenticated AACP routing events. It does not loop Bluetooth disconnect/connect, modify pairing keys, or implement Apple-account/iCloud Automatic Switching.
 
 ## Status
 
-Version 0.3 protects active Linux calls/media rather than auto-pausing a local player when iPhone requests ownership. Duplex Discord/Telegram streams and explicitly tagged communication sessions are tracked, including silence/mute grace. A conservative PipeWire fallback covers known media applications and Music/Movie/Video/Game streams without MPRIS; notifications and startup baselines do not create takeover intent.
+Version 0.4 protects active Linux calls/media rather than auto-pausing a local player when iPhone requests ownership. Duplex Discord/Telegram streams and explicitly tagged communication sessions are tracked, including silence/mute grace. A conservative PipeWire fallback covers known media applications and Music/Movie/Video/Game streams without MPRIS; notifications and startup baselines do not create takeover intent.
 
-New playback/call intent can request one controller-guarded `take-media` over remote music. A proven local session can also request one bounded recovery after an autonomous iPhone takeover; repeated contention stops at `LOCAL_CONTESTED`. The automatic path does not use unconditional `take --force`. The controller refreshes status and rejects calls/unknown types before changing ownership.
+New playback/call intent can request one controller-guarded `take-media` over remote music. A proven media session can request one bounded recovery after an autonomous iPhone takeover; repeated contention stops at `LOCAL_CONTESTED`. Continuing calls use a separate lease with three attempts per interruption, renewed only by verified source, transport and audio graph health. The automatic path does not use unconditional `take --force`. The controller refreshes status and rejects calls/unknown types before changing ownership.
 
-A2DP transport state is insufficient evidence of working audio. Paused/init output links into the matching AirPods sink are repaired once per link generation, without rebuilding the microphone/effect chain or disconnecting Bluetooth. Old intents/focus are discarded on sleep; resume refreshes the graph. There are 120 Python regression tests plus controller core tests.
+A2DP transport state is insufficient evidence of working audio. Paused/init output links into the matching AirPods sink are repaired once per link generation, without rebuilding the microphone/effect chain or disconnecting Bluetooth. Old intents/focus are discarded on sleep; resume refreshes the graph. There are 254 portable Python regression tests plus 57 native controller tests.
 
 Manual repair of the specific stalled output links was hearing-confirmed on one setup; the automatic repair was observed in logs. Full repeated hardware cycles, PC calls, sleep/resume, other models/adapters and ARM remain unverified. This does not implement Apple's closed cross-device arbiter or guarantee interruption-free ownership. It is an experimental project, not a stable-release claim.
 
@@ -73,7 +93,7 @@ The optional [Noctalia 5.2 / Luau API 24 panel](integrations/noctalia/README.md)
 
 Recovery now reacts immediately to a known sink error and repairs late-arriving graph edges within the same attempt. The extra 300ms restore delay was removed only for a proven local session and typed remote media. An initial optimized sample showed 264ms from ownership ACK to observed graph readiness; the user initially perceived little difference. The latest policy change is not an acoustic latency guarantee.
 
-## Background connection update (2026-11-01, hardware validation pending)
+## Background connection (hardware follow-up November 4)
 
 `autoConnect` and `preferIdlePC` default to true. Background connection opens
 only the AACP L2CAP channel of the explicitly selected, paired device. It never
@@ -90,13 +110,14 @@ validation by pausing iPhone music; the control-only replacement preserved iPhon
 
 ## Continuing PC calls
 
-A previously proven local call may reacquire ownership across AACP reconnection,
-including a typed phone-call source, using a separate fresh-source-checked
-`take-call` request. Unknown is rejected; three recovery attempts per continuous
-call, then explicit conflict/manual return. Hangup cancels queued work and suspend
-clears the lease. A fresh/baseline PC call does not automatically interrupt an
-already-owned iPhone call. Browser duplex matching is a heuristic, not a universal
-call-lifecycle API. Hardware verification of this update is separate from tests.
+A previously proven local call may recover across AACP reconnection with a
+fresh-source-checked `take-call` request. Typed remote calls and unknown sources
+are rejected. Each unresolved interruption permits at most three attempts; one
+second of verified local source, active transport and healthy audio graph renews
+the budget. An ACK alone does not. Hangup cancels queued work; suspend clears
+the lease. Native Discord has a narrowly scoped lifetime fallback for previously
+proven calls, matching VoiceEngine clients, process identity and owned UDP sockets.
+This is not a universal browser call-lifecycle API.
 
 ## Hardware follow-up (2026-11-02)
 
@@ -122,4 +143,7 @@ policy now lets explicit phone choice override an ongoing PC call or media
 lease, matching the intended Apple-like behavior. A bounded OPACK reader requires
 a typed true yield request and an exact manual reason. It invalidates pending
 returns and withdraws the PC call report without ending the call. A new explicit
-PC return/play/call can reselect the PC. Hardware validation is pending.
+PC return/play/call can reselect the PC. Hardware confirmed manual override during
+a continuing Discord call. Ordinary TikTok playback left Discord in AirPods and
+TikTok on the phone speaker after one initial roughly one-second interruption.
+See [verification](docs/verification.md); full macOS parity is not established.

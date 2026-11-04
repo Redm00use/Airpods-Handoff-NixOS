@@ -1,32 +1,31 @@
 # Changelog
 
-## Local merge — 2026-11-04
+## Unreleased — 2026-11-04
 
-- Incorporate upstream MPRIS revision/owner fences and string PipeWire client IDs.
-- Fence resume baselines, preserve authenticated generations on duplicate BlueZ signals, validate routing/graph input.
-- Reap helpers, restore interrupted edge deletions, close service resources and detect late sink errors.
-- Report evidence-based media modes and shadow status in the existing panel; honor XDG_CONFIG_HOME.
-- Preserve the newer control-only background connection, native call reports, manual iPhone selection and bounded call recovery.
-- 223 Python tests passed; no new acoustic call-stability claim.
+- Control-only background connection with bounded backoff and on-demand A2DP; prefer PC only when both hosts are confirmed idle.
+- Persistent call lease: at most three attempts per unresolved interruption; renew only after one second of verified source, transport and audio graph health.
+- Preserve explicit iPhone routing during a PC call, including across control reconnection; fence queued native claims against newer manual choices.
+- Add bounded native Discord voice-transport lifetime evidence for previously proven calls; client presence alone cannot start or retain a call.
+- Repair explicit PC return with local ownership and missing audio; clear stale peer-release work after manual mode ends.
+- Validate typed OPACK relay requests, native call announcements and source-safe call claims; reject remote calls and unknown sources.
+- Incorporate upstream MPRIS revision/owner fences, string client IDs, resume barriers, helper cleanup, late sink error handling and panel statuses.
+- Preserve optional Mac-like adapter identity and upstream CI. No official Apple Account integration.
+- Hardware: quiet background connection, Discord recovery, and manual iPhone override confirmed. One initial roughly one-second TikTok interruption remains; full macOS parity is not established.
 
-## Unreleased — continuing call priority
+## 0.4.0 — 2026-11-03
 
-- Preserve proven PC call recovery rights across AACP generations, with fresh commands and a three-attempt budget.
-- Typed take-call command revalidates source and rejects unknown; queued commands are cancelled on hangup.
-- Broader browser duplex detection; call evidence/conflict status exposed to the panel.
-- Suspend clears old call rights; no blanket claim of full Apple behavior.
-
-
-## Unreleased — background connection
-
-- Control-only background AACP connection with backoff; no audio-profile/ownership command on connect.
-- WirePlumber automatic profile connection disabled only for the selected device.
-- A2DP opened on demand after local ownership; initial background-profile design rejected by hardware test.
-- Prefer PC when both hosts are explicitly idle; revalidate before non-forced take.
-- Cancel stale connection work and prevent stale phone-call state from blocking resume.
-- Connection status and error diagnostics included in the panel protocol.
-- Hardware validation in progress; no claim of complete Apple Automatic Switching.
-
+- Resume a previously local, continuing call once after confirmed iPhone call end;
+  cancel on hangup, suspend, disconnect, or a new remote call.
+- Re-arm the single restore budget after 30 seconds of sustained local ownership,
+  so an unrelated later interruption does not remain blocked for the entire call.
+- Expose evidence-based local session modes and call applications in status/panel.
+- Add opt-in Mac-like Bluetooth identity without claiming Apple Account integration.
+- Fence stale MPRIS replies and suspend/resume baselines, latch fatal health failures,
+  and find the configured AirPods on any BlueZ adapter.
+- Reap cancelled helpers, close service sockets/tasks, validate routing and graph
+  input, and recover late sink errors independently of ownership command completion.
+- Honor XDG_CONFIG_HOME and show shadow mode explicitly.
+- Add lifecycle regression coverage and Python 3.11/3.13 CI alongside Nix checks.
 
 ## 0.3.0 — 2026-10-29
 
